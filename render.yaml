@@ -1,0 +1,12 @@
+# Render.com blueprint — creates a free web service for Mo's Journal
+services:
+  - type: web
+    name: mos-journal
+    runtime: node
+    plan: free
+    buildCommand: ""        # zero dependencies — nothing to install
+    startCommand: node server.js
+    autoDeploy: true
+    envVars:
+      - key: GIST_TOKEN     # optional but recommended: GitHub token with "gist" scope for cloud backup
+        sync: false
