@@ -1,6 +1,6 @@
 {
   "name": "mos-journal",
-  "version": "4.0.1",
+  "version": "4.2.0",
   "description": "Mo's Journal — FX & synthetic indices trading journal with gamification, psychology tracking and multi-account profiles",
   "main": "server.js",
   "scripts": {

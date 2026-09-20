@@ -362,12 +362,13 @@ function setupRows(t) {
   const map = new Map();
   t.forEach(tr => {
     const k = (tr.setup || '').trim() || '(no setup)';
-    if (!map.has(k)) map.set(k, { name: k, n: 0, wins: 0, pnl: 0, rW: [], rL: [], holds: [], holdsW: [], holdsL: [], tf: {}, pairPnl: {}, losers: [], winners: [] });
+    if (!map.has(k)) map.set(k, { name: k, n: 0, wins: 0, pnl: 0, rW: [], rL: [], rrP: [], holds: [], holdsW: [], holdsL: [], tf: {}, pairPnl: {}, losers: [], winners: [] });
     const r = map.get(k);
     r.n++; r.pnl = round2(r.pnl + (tr.pnl || 0));
     const w = tr.pnl > 0;
     if (w) r.wins++;
     if (tr.rMultiple != null) (w ? r.rW : r.rL).push(tr.rMultiple);
+    if (tr.rrPlanned != null && isFinite(tr.rrPlanned) && tr.rrPlanned > 0) r.rrP.push(tr.rrPlanned);
     const h = holdMs(tr);
     if (h != null) { r.holds.push(h); (w ? r.holdsW : r.holdsL).push(h); }
     if (tr.analysisTF && tr.executionTF) {
@@ -380,13 +381,21 @@ function setupRows(t) {
   return [...map.values()].map(r => {
     const tfKeys = Object.entries(r.tf).sort((a, b) => b[1] - a[1]);
     const bestPair = Object.entries(r.pairPnl).filter(([, p]) => p > 0).sort((a, b) => b[1] - a[1])[0];
+    const grossWinR = r.rW.reduce((a, b) => a + b, 0);
+    const grossLossR = Math.abs(r.rL.reduce((a, b) => a + b, 0));
     return {
       ...r,
       wr: r.n ? Math.round(r.wins / r.n * 100) : 0,
       avgR: (r.rW.length + r.rL.length) ? round2((r.rW.concat(r.rL).reduce((a, b) => a + b, 0)) / (r.rW.length + r.rL.length) * 100) / 100 : null,
       achievedRR: r.rW.length && r.rL.length && Math.abs(r.rL.reduce((a, b) => a + b, 0)) > 0
-        ? '1 : ' + round2((r.rW.reduce((a, b) => a + b, 0) / r.rW.length) / Math.abs(r.rL.reduce((a, b) => a + b, 0) / r.rL.length) * 10) / 10
+        ? '1 : ' + Math.round((r.rW.reduce((a, b) => a + b, 0) / r.rW.length) / Math.abs(r.rL.reduce((a, b) => a + b, 0) / r.rL.length) * 10) / 10
         : null,
+      avgPlannedRR: r.rrP.length ? '1 : ' + Math.round(r.rrP.reduce((a, b) => a + b, 0) / r.rrP.length * 10) / 10 : null,
+      overallRR: (r.rW.length + r.rL.length)
+        ? (grossLossR > 0 ? '1 : ' + Math.round(grossWinR / grossLossR * 10) / 10 : (grossWinR > 0 ? '1 : ∞' : null))
+        : null,
+      overallRRnum: grossLossR > 0 ? grossWinR / grossLossR : (grossWinR > 0 ? 99 : 0),
+      totalR: (r.rW.length + r.rL.length) ? round2(grossWinR - grossLossR) : null,
       avgHold: r.holds.length ? r.holds.reduce((a, b) => a + b, 0) / r.holds.length : null,
       avgHoldW: r.holdsW.length ? r.holdsW.reduce((a, b) => a + b, 0) / r.holdsW.length : null,
       avgHoldL: r.holdsL.length ? r.holdsL.reduce((a, b) => a + b, 0) / r.holdsL.length : null,
@@ -876,20 +885,24 @@ function renderAnalytics(v, t) {
 function labCard(lab, fps) {
   const named = lab.filter(r => r.name !== '(no setup)');
   if (!named.length) return '';
-  return `<div class="card"><div class="card-title">🧪 Setup Lab <span class="sub">your strategies, graded · add exit time + TFs on trades for full power</span></div>
+  return `<div class="card"><div class="card-title">🧪 Setup Lab <span class="sub">planned → actual → overall R:R per setup · your backtest edge, live</span></div>
     <div class="lab-scroll"><table class="lab-table">
-      <tr><th>Setup</th><th>N</th><th>Win%</th><th>Avg R</th><th>R:R ach.</th><th>Avg hold</th><th>Best on</th><th style="text-align:right">P&L</th></tr>
+      <tr><th>Setup</th><th>N</th><th>Win%</th><th>Avg R</th><th>RR plan</th><th>RR actual</th><th>RR overall</th><th>Σ R</th><th>Avg hold</th><th>Best on</th><th style="text-align:right">P&L</th></tr>
       ${named.map(r => `<tr>
         <td><span class="lab-setup">${esc(r.name)}</span>${r.tfLabel ? `<span class="lab-tf">${esc(r.tfLabel)}</span>` : ''}</td>
         <td>${r.n}</td>
         <td><b class="${r.wr >= 50 ? 'pos' : r.wr < 40 ? 'neg' : ''}">${r.wr}%</b></td>
         <td class="mono ${r.avgR == null ? '' : (r.avgR > 0 ? 'pos' : 'neg')}">${r.avgR == null ? '—' : (r.avgR > 0 ? '+' : '') + r.avgR + 'R'}</td>
+        <td class="mono" style="color:var(--muted)">${r.avgPlannedRR || '—'}</td>
         <td class="mono">${r.achievedRR || '—'}</td>
+        <td class="mono ${r.overallRR ? (r.overallRRnum >= 1 ? 'pos' : 'neg') : ''}" style="font-weight:800">${r.overallRR || '—'}</td>
+        <td class="mono ${r.totalR == null ? '' : (r.totalR > 0 ? 'pos' : 'neg')}">${r.totalR == null ? '—' : (r.totalR > 0 ? '+' : '') + r.totalR + 'R'}</td>
         <td>${r.avgHold ? holdFmt(r.avgHold) : '—'}</td>
         <td style="color:var(--muted)">${r.bestOn ? esc(r.bestOn) : '—'}</td>
         <td class="mono ${cls(r.pnl)}" style="text-align:right;font-weight:800">${money(r.pnl)}</td>
       </tr>`).join('')}
     </table></div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px">🧮 <b>RR overall</b> = every 1 unit of risk the setup lost → units of risk it won back (backtester's profit factor). RR plan = what you aimed (planned TP vs SL) · RR actual = what you achieved.</div>
     ${fps.length ? `<div class="mt">${fps.map(f => `
       <div class="insight" style="border-left-color:var(--red)"><span class="i-emoji">❌</span>
         <span><b>Why “${esc(f.name)}${f.tf ? ' · ' + esc(f.tf) : ''}” fails</b> (${f.n} losses): ${f.bits.join(' · ')}</span></div>`).join('')}</div>` : ''}
@@ -1234,6 +1247,9 @@ window.openAddChooser = () => {
   </div>`;
 };
 
+const AF_MAX_SHOTS = 12;   // AUTO-FILL batch ceiling — parsed in rounds of 4 (free-tier vision safe)
+const AF_BATCH = 4;
+
 window.openAutofill = () => {
   S.af = { method: null, images: [], text: '', hint: '', drafts: null, busy: false, status: '' };
   renderAutofill();
@@ -1292,7 +1308,7 @@ function afInputBody() {
   if (af.method === 'shots') {
     return aiReady() ? `
       <div class="upload-drop" id="afDrop"><span class="big">🖼️</span>
-        <span>Tap to add screenshots — broker history, positions, P&amp;L, charts (up to 6)</span>
+        <span>Tap to add screenshots — history, positions, P&amp;L cards, charts (up to 12 — the more the AI sees, the richer the draft)</span>
         <input type="file" id="afInput" accept="image/*" multiple class="hidden"></div>
       <div class="af-preview" id="afPreview"></div>
       <div class="field mt"><label>Context for the AI (optional)</label>
@@ -1355,7 +1371,10 @@ function wireAutofill() {
     drop.onclick = () => input.click();
     if (af.method === 'shots') {
       input.onchange = async e => {
-        for (const f of [...e.target.files].slice(0, 6 - af.images.length)) {
+        const files = [...e.target.files];
+        const room = Math.max(0, AF_MAX_SHOTS - af.images.length);
+        if (files.length > room) toast(`📸 Max ${AF_MAX_SHOTS} screenshots per batch — extra ${files.length - room} skipped`);
+        for (const f of files.slice(0, room)) {
           try {
             const data = await compressImage(f);
             af.images.push({ data, ext: '.jpg', preview: 'data:image/jpeg;base64,' + data });
@@ -1400,8 +1419,26 @@ function renderAfPreview() {
   const af = S.af;
   const el = $('#afPreview'); if (!el) return;
   el.innerHTML = af.images.map((im, i) => `
-    <div class="af-img"><img src="${im.preview}" alt=""><button onclick="S.af.images.splice(${i},1);renderAfPreview()">✕</button></div>`).join('');
+    <div class="af-img"><img src="${im.preview}" alt=""><button onclick="S.af.images.splice(${i},1);renderAfPreview()">✕</button></div>`).join('')
+    + (af.images.length
+      ? `<div style="font-size:12px;color:var(--muted);margin-top:8px">${af.images.length}/${AF_MAX_SHOTS} loaded${af.images.length > AF_BATCH ? ` · AI will read them in ${Math.ceil(af.images.length / AF_BATCH)} rounds` : ''} · ✕ removes one</div>`
+      : '');
   const go = $('#afGo'); if (go) go.disabled = !af.images.length;
+}
+
+// fuzzy-match two raw AI trade extractions (same row visible across overlapping screenshots)
+function rawTradeSame(a, b) {
+  const pa = String(a.pair || a.symbol || a.instrument || '').toLowerCase();
+  const pb = String(b.pair || b.symbol || b.instrument || '').toLowerCase();
+  if (pa && pb && pa !== pb) return false;
+  const da = /sell|short/i.test(a.dir || a.type || '') ? 'short' : 'long';
+  const db = /sell|short/i.test(b.dir || b.type || '') ? 'short' : 'long';
+  if (da !== db) return false;
+  const ea = num(a.entry ?? a.openPrice ?? a.open), eb = num(b.entry ?? b.openPrice ?? b.open);
+  if (ea != null && eb != null && Math.abs(ea - eb) > Math.max(1e-9, Math.abs(ea) * 0.002)) return false;
+  const ta = String(a.openTime || a.date || a.time || '');
+  const tb = String(b.openTime || b.date || b.time || '');
+  return ta === tb || !ta || !tb;
 }
 
 async function runAIParse({ images = [], text = '' }) {
@@ -1412,8 +1449,25 @@ async function runAIParse({ images = [], text = '' }) {
   if (status) status.innerHTML = 'Extracting trades… this takes a few seconds ⏳';
   try {
     const hint = $('#afHint') ? $('#afHint').value.trim() : '';
-    const res = await api('/api/ai-parse', 'POST', { images, text, hint });
-    const raw = (res.trades || []).map(d => {
+    // multi-shot mode: free-tier vision caps ~5 images/request, so feed in rounds of 4 and merge
+    let tradesRaw = [];
+    if (images.length) {
+      const rounds = [];
+      for (let i = 0; i < images.length; i += AF_BATCH) rounds.push(images.slice(i, i + AF_BATCH));
+      for (let r = 0; r < rounds.length; r++) {
+        if (status) status.innerHTML = rounds.length > 1
+          ? `🧠 AI reading round ${r + 1}/${rounds.length} of your screenshots… ⏳`
+          : 'Extracting trades… this takes a few seconds ⏳';
+        const res = await api('/api/ai-parse', 'POST', { images: rounds[r], hint });
+        for (const d of (res.trades || [])) {
+          if (!tradesRaw.some(x => rawTradeSame(x, d))) tradesRaw.push(d); // same trade on 2 screenshots = one draft
+        }
+      }
+    } else {
+      const res = await api('/api/ai-parse', 'POST', { images: [], text, hint });
+      tradesRaw = res.trades || [];
+    }
+    const raw = tradesRaw.map(d => {
       // AI field names → our schema
       const d2 = {
         pair: d.pair || d.symbol || d.instrument,

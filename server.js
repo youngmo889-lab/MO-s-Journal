@@ -279,7 +279,7 @@ const server = http.createServer(async (req, res) => {
       let body;
       try { body = await readBody(req); } catch (e) { return send(res, 400, { ok: false, error: 'BAD_BODY' }); }
       const content = [{ type: 'text', text: AI_EXTRACT_PROMPT + (body.hint ? '\nContext from the trader: ' + String(body.hint).slice(0, 500) : '') }];
-      (body.images || []).slice(0, 6).forEach(im => {
+      (body.images || []).slice(0, 8).forEach(im => {
         const b64 = String(im.data || '').replace(/^data:image\/\w+;base64,/, '');
         if (b64.length > 100) content.push({ type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + b64 } });
       });
