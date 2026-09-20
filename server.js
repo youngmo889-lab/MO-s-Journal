@@ -19,6 +19,12 @@ try { fs.mkdirSync(UPLOADS, { recursive: true }); } catch (e) { /* exists */ }
 /* ---------------- AI AUTO-FILL config ----------------
    Bring-your-own-key vision parsing. Any OpenAI-compatible endpoint works.
    Resolution order: env vars → in-app Settings (never echoed back to client). */
+// Free vision lanes (OpenRouter, live-verified 2026-09-20) — ordered by extraction quality.
+// If the configured model 429s/404s, the parser rotates down this chain automatically.
+const FREE_VISION_FALLBACK = [
+  'google/gemma-4-31b-it:free', 'qwen/qwen3.8-27b:free', 'nex-agi/nex-n2.5-pro:free',
+  'inclusionai/ling-3.0-flash-vl:free', 'google/gemma-4-26b-a4b-it:free', 'nex-agi/nex-n2.5-mini:free',
+];
 function aiCfg() {
   const s = (state.settings && state.settings.ai) || {};
   return {
@@ -252,6 +258,7 @@ const server = http.createServer(async (req, res) => {
       if (s.ai) {
         const keep = state.settings.ai || {};
         s.ai = { ...keep, ...s.ai };
+        if (typeof s.ai.key === 'string' && s.ai.key) s.ai.key = s.ai.key.trim();
         if (!s.ai.key || s.ai.key.includes('•')) s.ai.key = keep.key || '';
       }
       state.settings = { ...state.settings, ...s };
@@ -284,30 +291,42 @@ const server = http.createServer(async (req, res) => {
         if (b64.length > 100) content.push({ type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + b64 } });
       });
       if (body.text) content[0].text += '\n\nPasted history/text to extract from:\n' + String(body.text).slice(0, 12000);
-      try {
-        const r = await fetch(cfg.base + '/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': 'Bearer ' + cfg.key, 'Content-Type': 'application/json',
-            'HTTP-Referer': 'https://mos-journal.app', 'X-Title': "Mo's Journal",
-          },
-          body: JSON.stringify({ model: cfg.model, messages: [{ role: 'user', content }], temperature: 0.1, max_tokens: 3000 }),
-          signal: AbortSignal.timeout(90000),
-        });
-        if (!r.ok) {
+      // lane-hopping: free-model pools congest (429) and retire (404) — rotate until one answers.
+      const laneHop = /openrouter\.ai|localhost|127\.0\.0\.1/.test(cfg.base);
+      const chain = [cfg.model, ...(laneHop ? FREE_VISION_FALLBACK : [])].filter((m, i, a) => m && a.indexOf(m) === i);
+      let lastErr = '';
+      for (const model of chain) {
+        try {
+          const r = await fetch(cfg.base + '/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': 'Bearer ' + cfg.key, 'Content-Type': 'application/json',
+              'HTTP-Referer': 'https://mos-journal.app', 'X-Title': "Mo's Journal",
+            },
+            body: JSON.stringify({ model, messages: [{ role: 'user', content }], temperature: 0.1, max_tokens: 3000 }),
+            signal: AbortSignal.timeout(90000),
+          });
+          if (r.ok) {
+            const j = await r.json();
+            const raw = j.choices?.[0]?.message?.content || '';
+            const m = raw.match(/\{[\s\S]*\}/);
+            let parsed;
+            try { parsed = m ? JSON.parse(m[0]) : { trades: [] }; }
+            catch (e) { return send(res, 400, { ok: false, error: 'AI_FAIL', message: 'AI returned unreadable JSON — try again or a cleaner screenshot.' }); }
+            return send(res, 200, { ok: true, via: model, trades: Array.isArray(parsed.trades) ? parsed.trades : [] });
+          }
           const t = await r.text();
-          return send(res, 400, { ok: false, error: 'AI_FAIL', message: `AI error ${r.status}: ${t.slice(0, 250)}` });
+          lastErr = `AI error ${r.status}: ${t.slice(0, 250)}`;
+          if (r.status === 401 || r.status === 402 || r.status === 403) break; // auth/billing — no lane helps
+          // 404 (model retired) / 429 (lane busy) / 5xx (flake) → next lane
+        } catch (e) {
+          lastErr = e.name === 'TimeoutError' ? 'AI took too long — try fewer/smaller images.' : e.message;
         }
-        const j = await r.json();
-        const raw = j.choices?.[0]?.message?.content || '';
-        const m = raw.match(/\{[\s\S]*\}/);
-        let parsed;
-        try { parsed = m ? JSON.parse(m[0]) : { trades: [] }; }
-        catch (e) { return send(res, 400, { ok: false, error: 'AI_FAIL', message: 'AI returned unreadable JSON — try again or a cleaner screenshot.' }); }
-        return send(res, 200, { ok: true, trades: Array.isArray(parsed.trades) ? parsed.trades : [] });
-      } catch (e) {
-        return send(res, 400, { ok: false, error: 'AI_FAIL', message: e.name === 'TimeoutError' ? 'AI took too long — try fewer/smaller images.' : e.message });
       }
+      return send(res, 400, {
+        ok: false, error: 'AI_FAIL', lanesTried: chain.length,
+        message: lastErr + (chain.length > 1 ? ` — tried ${chain.length} free lanes, all busy. Wait ~60 seconds and press Analyze again; don't change any settings.` : ''),
+      });
     }
 
     if (p === '/api/upload' && req.method === 'POST') {

@@ -68,8 +68,8 @@ const PROFILE_TYPES = ['Live', 'Demo', 'Prop Challenge', 'Funded'];
 const PROFILE_BROKERS = ['Weltrade', 'Deriv', 'Other'];
 
 const AI_PRESETS = [
-  { name: 'OpenRouter · free tier', base: 'https://openrouter.ai/api/v1', model: 'meta-llama/llama-4-scout-17b-16e-instruct', hint: 'free key at openrouter.ai/keys' },
-  { name: 'Groq · free tier',       base: 'https://api.groq.com/openai/v1', model: 'meta-llama/llama-4-scout-17b-16e-instruct', hint: 'free key at console.groq.com' },
+  { name: 'OpenRouter · free vision', base: 'https://openrouter.ai/api/v1', model: 'google/gemma-4-31b-it:free', hint: 'free key at openrouter.ai/keys · auto-hops 6 free lanes if one is busy' },
+  { name: 'Groq · paste only',       base: 'https://api.groq.com/openai/v1', model: 'openai/gpt-oss-120b', hint: 'free key at console.groq.com · paste/history text only (Groq dropped vision in 2026)' },
   { name: 'OpenAI',                 base: 'https://api.openai.com/v1', model: 'gpt-4o-mini', hint: 'paid · platform.openai.com' },
   { name: 'Custom',                 base: '', model: '', hint: 'any OpenAI-compatible endpoint' },
 ];
@@ -1251,7 +1251,7 @@ const AF_MAX_SHOTS = 12;   // AUTO-FILL batch ceiling — parsed in rounds of 4 
 const AF_BATCH = 4;
 
 window.openAutofill = () => {
-  S.af = { method: null, images: [], text: '', hint: '', drafts: null, busy: false, status: '' };
+  S.af = { method: null, images: [], text: '', hint: '', drafts: null, busy: false, status: '', via: '' };
   renderAutofill();
 };
 
@@ -1347,7 +1347,7 @@ function afDraftsBody() {
       <button class="btn btn-block" onclick="afBack()">← Try again</button>`;
   }
   return `
-    <div class="af-status" style="margin:0 0 12px"><b>${af.drafts.filter(d => !d.dup).length} new trades</b> found${af.drafts.some(d => d.dup) ? ` · ${af.drafts.filter(d => d.dup).length} already logged (skipped)` : ''}.
+    <div class="af-status" style="margin:0 0 12px"><b>${af.drafts.filter(d => !d.dup).length} new trades</b> found${af.drafts.some(d => d.dup) ? ` · ${af.drafts.filter(d => d.dup).length} already logged (skipped)` : ''}${af.via ? ` <span style="color:var(--muted)">· 🧠 answered by ${esc(af.via.split('/').pop())}</span>` : ''}.
       Review each one, or bulk-import:</div>
     ${af.drafts.map((d, i) => `
       <div class="draft-row ${d.dup ? 'dup' : ''}">
@@ -1459,12 +1459,14 @@ async function runAIParse({ images = [], text = '' }) {
           ? `🧠 AI reading round ${r + 1}/${rounds.length} of your screenshots… ⏳`
           : 'Extracting trades… this takes a few seconds ⏳';
         const res = await api('/api/ai-parse', 'POST', { images: rounds[r], hint });
+        if (res.via) af.via = res.via;
         for (const d of (res.trades || [])) {
           if (!tradesRaw.some(x => rawTradeSame(x, d))) tradesRaw.push(d); // same trade on 2 screenshots = one draft
         }
       }
     } else {
       const res = await api('/api/ai-parse', 'POST', { images: [], text, hint });
+      if (res.via) af.via = res.via;
       tradesRaw = res.trades || [];
     }
     const raw = tradesRaw.map(d => {
