@@ -54,6 +54,7 @@ const SYMBOLS = [
   'Range Break 100', 'Range Break 200',
   'DEX 600 UP', 'DEX 900 UP', 'DEX 1200 UP', 'DEX 600 DOWN', 'DEX 900 DOWN', 'DEX 1200 DOWN',
   'Multi Step 2', 'Multi Step 4', 'Drift Switch Up', 'Drift Switch Down',
+  'FX Vol 10', 'FX Vol 20', 'FX Vol 30', 'FX Vol 40', 'FX Vol 50', 'FX Vol 60', 'FX Vol 70', 'FX Vol 80', 'FX Vol 90', 'FX Vol 100',
   'XAUUSD', 'EURUSD', 'GBPUSD', 'USDJPY',
 ];
 
@@ -176,7 +177,7 @@ async function api(path, method = 'GET', body) {
 }
 
 /* ---------------- Instrument math ---------------- */
-const isSynthetic = sym => /^(Volatility|Boom|Crash|Step|Jump|Range|DEX|Multi|Drift|Hybrid|Accumulator)/i.test(String(sym || '').trim());
+const isSynthetic = sym => /^(Volatility|Boom|Crash|Step|Jump|Range|DEX|Multi|Drift|Hybrid|Accumulator|FX\s?Vol(atility)?|FXVol)/i.test(String(sym || '').trim());
 function pointSize(pair) {
   if (isSynthetic(pair)) return 1;
   pair = String(pair).toUpperCase().replace('/', '');
@@ -1348,7 +1349,7 @@ function afDraftsBody() {
   }
   return `
     <div class="af-status" style="margin:0 0 12px"><b>${af.drafts.filter(d => !d.dup).length} new trades</b> found${af.drafts.some(d => d.dup) ? ` · ${af.drafts.filter(d => d.dup).length} already logged (skipped)` : ''}${af.via ? ` <span style="color:var(--muted)">· 🧠 answered by ${esc(af.via.split('/').pop())}</span>` : ''}.
-      Review each one, or bulk-import:</div>
+      Review each one, or bulk-import:${af.images.length ? ` <span style="color:var(--muted)">📎 your ${af.images.length} shot${af.images.length > 1 ? 's' : ''} attach to each trade — shared setup, shared evidence (✕ any wrong ones in review)</span>` : ''}</div>
     ${af.drafts.map((d, i) => `
       <div class="draft-row ${d.dup ? 'dup' : ''}">
         <span style="font-size:20px">${d.dir === 'long' ? '🟢' : '🔴'}</span>
@@ -1486,7 +1487,7 @@ async function runAIParse({ images = [], text = '' }) {
       return normalizeDraftForApp(d2);
     }).filter(Boolean);
     af.drafts = markDups(raw);
-    if (images.length && raw.length === 1) raw[0]._shots = images; // single trade → attach the shots to it
+    if (images.length) af.drafts.forEach(d => { d._shots = images; }); // same-setup batches: every trade shares the evidence
     af.status = raw.length ? '' : 'The AI looked but found no trades it trusted. Add a hint or a clearer crop.';
     renderAutofill();
   } catch (e) {
@@ -1539,11 +1540,22 @@ window.afReview = (i) => {
   if (!d || d.dup) return;
   openTradeForm(null, d);
 };
+async function uploadStagedShots(shots) {
+  const out = [];
+  for (const sh of shots) {
+    try {
+      const res = await api('/api/upload', 'POST', { data: sh.data, ext: sh.ext || '.jpg' });
+      out.push({ url: res.url, cat: 'Analysis', caption: '' });
+    } catch (e) { /* screenshot attach is best-effort */ }
+  }
+  return out;
+}
+
 window.afImportAll = async () => {
   const fresh = S.af.drafts.filter(d => !d.dup);
   if (!fresh.length) return;
   const defProfile = S.view !== 'all' ? S.view : S.profiles[0].id;
-  let done = 0;
+  let done = 0, shotsAttached = 0;
   for (const d of fresh) {
     const date = new Date(d.date);
     const trade = {
@@ -1556,11 +1568,15 @@ window.afImportAll = async () => {
       rules: {}, mistakes: [], lesson: '', notes: '', screenshots: [],
       imported: true,
     };
+    if (d._shots && d._shots.length) {
+      trade.screenshots = await uploadStagedShots(d._shots);
+      shotsAttached += trade.screenshots.length;
+    }
     await api('/api/trade', 'POST', trade);
     done++;
   }
   await loadState(); closeModal(); renderAll();
-  toast(`🪄 ${done} trades AUTO-FILLED!`, 'gold'); confettiBurst();
+  toast(`🪄 ${done} trades AUTO-FILLED!${shotsAttached ? ` 📎 ${shotsAttached} screenshots attached` : ''}`, 'gold'); confettiBurst();
   go('journal');
 };
 
