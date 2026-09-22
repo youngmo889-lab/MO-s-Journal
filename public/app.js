@@ -1293,7 +1293,13 @@ window.importJSON = async e => {
   try {
     const data = JSON.parse(await f.text());
     if (!Array.isArray(data.trades)) throw new Error('bad file');
-    await api('/api/import', 'POST', data);
+    let r = await api('/api/import', 'POST', data);
+    if (r && r.error === 'IMPORT_SHRINK') {
+      if (!confirm(r.message + '\n\nImport anyway and overwrite?')) { e.target.value = ''; return; }
+      data.force = true;
+      r = await api('/api/import', 'POST', data);
+      if (r && r.error) throw new Error(r.message);
+    }
     await loadState(); toast('✅ Imported ' + data.trades.length + ' trades'); renderAll();
   } catch (err) { toast('⚠️ Import failed — is that a Mo backup file?'); }
   e.target.value = '';
@@ -1310,7 +1316,7 @@ window.loadDemo = async () => {
 window.wipeAll = async () => {
   if (!confirm('Wipe ALL trades across ALL accounts? Accounts stay.')) return;
   if (!confirm('Really really? No undo. (Export first?)')) return;
-  await api('/api/import', 'POST', { trades: [], profiles: S.profiles, settings: S.settings });
+  await api('/api/import', 'POST', { trades: [], profiles: S.profiles, settings: S.settings, force: true }); // wipe was double-confirmed — carry the flag past the shrink-guard
   S.trades = []; toast('🗑️ Fresh slate. Let\'s go.'); renderAll();
 };
 

@@ -29,13 +29,24 @@ function aiCfg() {
   const s = (state.settings && state.settings.ai) || {};
   return {
     base: (process.env.AI_BASE_URL || s.base || 'https://openrouter.ai/api/v1').replace(/\/$/, ''),
-    model: process.env.AI_MODEL || s.model || 'meta-llama/llama-4-scout-17b-16e-instruct',
+    model: process.env.AI_MODEL || s.model || 'google/gemma-4-31b-it:free',
     key: process.env.AI_KEY || s.key || '',
   };
 }
+function aiHeaders(cfg) {
+  const h = {
+    'Authorization': 'Bearer ' + cfg.key,
+    'Content-Type': 'application/json',
+    'HTTP-Referer': 'https://mos-journal.app',
+    'X-Title': "Mo's Journal",
+  };
+  // Google's new-format keys (AQ…) talk to the OpenAI-compat endpoint via x-goog-api-key, not Bearer
+  if (/googleapis\.com/.test(cfg.base)) h['x-goog-api-key'] = cfg.key;
+  return h;
+}
 const maskAI = ai => ({
   base: ai?.base || 'https://openrouter.ai/api/v1',
-  model: ai?.model || 'meta-llama/llama-4-scout-17b-16e-instruct',
+  model: ai?.model || 'google/gemma-4-31b-it:free',
   key: '',
   configured: !!(process.env.AI_KEY || ai?.key),
 });
@@ -180,6 +191,7 @@ async function gistBoot() {
       const content = full.files[GIST_FILE] && full.files[GIST_FILE].content;
       if (content && content.length > 10) state = migrate(JSON.parse(content));
       decodeVaultShots(full.files);
+      gist.restored = true;
       console.log('☁️  Gist sync: ON (existing backup found)');
     } else {
       console.log('☁️  Gist sync: ON (backup gist will be created on first save)');
@@ -195,6 +207,17 @@ function scheduleGistSave() {
   clearTimeout(gistTimer);
   gistTimer = setTimeout(async () => {
     try {
+      if (!gist.enabled) {
+        // NEVER CLOBBER THE VAULT: if the boot handshake blinked (Render cold-start),
+        // re-arm the link first — and only push once the vault is proven reachable.
+        if (Date.now() - (gist.lastRetry || 0) > 60000) {
+          gist.lastRetry = Date.now();
+          console.log('☁️  vault link down — re-arming before any save…');
+          await gistBoot();
+        }
+        if (!gist.enabled) { console.log('☁️  vault still unreachable — holding data locally, will retry.'); return; }
+        scheduleSave(); // state may have been restored — persist it locally too
+      }
       const files = { [GIST_FILE]: { content: JSON.stringify(state) } };
       // sweep new screenshots into the vault ride-along (max ~25MB per sweep)
       const swept = [];
@@ -280,7 +303,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, pub);
     }
     if (p === '/api/meta' && req.method === 'GET') {
-      return send(res, 200, { version: 4, gistSync: gist.enabled, aiConfigured: !!aiCfg().key, pixelVault: cloudReady() || gist.enabled, shotsVaulted: ensureVaultMeta().length });
+      return send(res, 200, { version: 4, gistSync: gist.enabled, gistFound: !!gist.id, restored: !!gist.restored, aiConfigured: !!aiCfg().key, pixelVault: cloudReady() || gist.enabled, shotsVaulted: ensureVaultMeta().length });
     }
 
     if (p === '/api/trade' && req.method === 'POST') {
@@ -363,21 +386,32 @@ const server = http.createServer(async (req, res) => {
       const cfg = aiCfg();
       if (!cfg.key) return send(res, 400, { ok: false, error: 'NO_KEY', message: 'No AI key configured yet.' });
       try {
-        // OpenRouter's /models is PUBLIC — a dead key would still "connect".
-        // /auth/key is the truth: 401 here = the key/account itself is rejected.
         const isOR = /openrouter\.ai/.test(cfg.base);
-        const r = await fetch(cfg.base + (isOR ? '/auth/key' : '/models'), {
-          headers: { 'Authorization': 'Bearer ' + cfg.key },
-          signal: AbortSignal.timeout(20000),
-        });
+        const isGoog = /googleapis\.com/.test(cfg.base);
+        let r;
+        if (isGoog) {
+          // Google's /models doesn't verify keys (same lie as OpenRouter's public endpoint once told).
+          // The only truth is a real authenticated call — 1 token, real probe.
+          r = await fetch(cfg.base + '/chat/completions', {
+            method: 'POST', headers: aiHeaders(cfg),
+            body: JSON.stringify({ model: cfg.model, messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }], max_tokens: 1 }),
+            signal: AbortSignal.timeout(30000),
+          });
+        } else {
+          // OpenRouter /auth/key truly verifies; Groq/OpenAI /models enforce auth properly.
+          r = await fetch(cfg.base + (isOR ? '/auth/key' : '/models'), {
+            headers: { 'Authorization': 'Bearer ' + cfg.key },
+            signal: AbortSignal.timeout(20000),
+          });
+        }
         if (!r.ok) {
           const txt = await r.text().catch(() => '');
           const notFound = /user not found/i.test(txt);
           return send(res, 400, {
             ok: false, error: 'AI_AUTH',
             message: notFound
-              ? '"User not found" — this key belongs to a deleted/changed OpenRouter account. Open openrouter.ai/keys while SIGNED IN (check the email top-right), mint a FRESH key, paste & Save here.'
-              : `Provider rejected the key (${r.status}) — mint a fresh key from your provider, paste & Save.`,
+              ? '"User not found" — this key belongs to a deleted/changed account. Open the provider while SIGNED IN (check the email top-right), mint a FRESH key, paste & Save here.'
+              : `Key rejected by provider (${r.status}): ${txt.slice(0, 160)} — re-check the key or mint a fresh one, then Save & Test again.`,
           });
         }
         return send(res, 200, { ok: true, message: `Connected ✓ key verified using ${cfg.model}` });
@@ -404,10 +438,7 @@ const server = http.createServer(async (req, res) => {
         try {
           const r = await fetch(cfg.base + '/chat/completions', {
             method: 'POST',
-            headers: {
-              'Authorization': 'Bearer ' + cfg.key, 'Content-Type': 'application/json',
-              'HTTP-Referer': 'https://mos-journal.app', 'X-Title': "Mo's Journal",
-            },
+            headers: aiHeaders(cfg),
             body: JSON.stringify({ model, messages: [{ role: 'user', content }], temperature: 0.1, max_tokens: 3000 }),
             signal: AbortSignal.timeout(90000),
           });
@@ -461,6 +492,15 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/api/import' && req.method === 'POST') {
       const body = await readBody(req);
+      // shrink-guard: a stale backup must never silently erase history
+      const tN = Array.isArray(body.trades) ? body.trades.length : null;
+      const pN = Array.isArray(body.profiles) ? body.profiles.length : null;
+      if (body.force !== true && ((tN != null && tN < state.trades.length) || (pN != null && pN < state.profiles.length))) {
+        return send(res, 409, {
+          ok: false, error: 'IMPORT_SHRINK',
+          message: `⚠️ This file would SHRINK your journal: ${state.trades.length} trades → ${tN}, ${state.profiles.length} accounts → ${pN}. Only import it if you're deliberately restoring an older backup.`,
+        });
+      }
       if (Array.isArray(body.trades)) state.trades = body.trades;
       if (Array.isArray(body.profiles)) state.profiles = body.profiles;
       if (body.settings && typeof body.settings === 'object') state.settings = body.settings;
@@ -508,6 +548,12 @@ const server = http.createServer(async (req, res) => {
 
 (async () => {
   await gistBoot();
+  // cold-start blink insurance: if GitHub hiccuped at boot, quietly retry the vault link
+  if (GIST_TOKEN && !gist.enabled) {
+    [15000, 45000, 90000].forEach((ms, i) => setTimeout(async () => {
+      if (!gist.enabled) { console.log(`☁️  vault retry #${i + 1} (cold-start blink)`); await gistBoot(); }
+    }, ms));
+  }
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`📒 Mo's Journal v4 · SMART edition running on http://0.0.0.0:${PORT}${GIST_TOKEN ? ' · gist sync enabled' : ''}`);
   });
