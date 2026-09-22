@@ -204,17 +204,19 @@ function computeNumbers(f) {
   const pair = (f.pair || '').trim();
   const lots = num(f.lots), entry = num(f.entry), exit = num(f.exit);
   const out = { pips: null, pnlEstimated: null, riskAmount: null, rMultiple: null, rrPlanned: null };
-  if (!pair || lots == null || entry == null || exit == null) return out;
-  const dir = f.dir === 'short' ? -1 : 1;
-  const diff = (exit - entry) * dir;
-  out.pips = round2(diff / pointSize(pair) * 10) / 10;
-  out.pnlEstimated = distToUsd(pair, diff, lots);
+  if (!pair || lots == null || entry == null) return out;
+  // plan pricing works even with no exit yet — a running leg still shows its $-at-risk & planned R:R
   const sl = num(f.sl);
   if (sl != null) out.riskAmount = distToUsd(pair, Math.abs(entry - sl), lots);
   const tp = num(f.tp);
   if (sl != null && tp != null && Math.abs(entry - sl) > 0) {
     out.rrPlanned = round2(Math.abs(tp - entry) / Math.abs(entry - sl) * 100) / 100;
   }
+  if (exit == null) return out; // 🏃 still running — outcome math waits for the close
+  const dir = f.dir === 'short' ? -1 : 1;
+  const diff = (exit - entry) * dir;
+  out.pips = round2(diff / pointSize(pair) * 10) / 10;
+  out.pnlEstimated = distToUsd(pair, diff, lots);
   const finalPnl = (f.pnlOverride !== '' && f.pnlOverride != null && f.pnlOverride !== undefined) ? num(f.pnlOverride) : (f.pnl != null ? num(f.pnl) : out.pnlEstimated);
   if (out.riskAmount && out.riskAmount > 0 && finalPnl != null) {
     out.rMultiple = round2(finalPnl / out.riskAmount * 100) / 100;
@@ -362,6 +364,7 @@ function byDim(trades, key) {
 function setupRows(t) {
   const map = new Map();
   t.forEach(tr => {
+    if (tr.running) return; // runners haven't told their story yet — the Lab grades closed books only
     const k = (tr.setup || '').trim() || '(no setup)';
     if (!map.has(k)) map.set(k, { name: k, n: 0, wins: 0, pnl: 0, rW: [], rL: [], rrP: [], holds: [], holdsW: [], holdsL: [], tf: {}, pairPnl: {}, losers: [], winners: [] });
     const r = map.get(k);
@@ -626,7 +629,9 @@ function tradeCard(t) {
       ${prof ? `<span class="tc-tag" style="padding:3px 8px">${prof.emoji || '💼'} ${esc(prof.name)}</span>` : ''}
       ${disc != null ? `<span class="disc-ring" style="background:${disc === 100 ? 'var(--lime-dim)' : 'var(--card2)'};color:${disc === 100 ? 'var(--lime)' : 'var(--muted)'}">${disc}%</span>` : ''}
       <span class="tc-date">${fmtDate(t.date)}</span>
-      <span class="tc-pnl mono ${cls(t.pnl)}">${money(t.pnl)}</span>
+      ${t.running
+        ? `<span class="tc-pnl mono" style="color:var(--gold)">🏃 running</span>`
+        : `<span class="tc-pnl mono ${cls(t.pnl)}">${money(t.pnl)}</span>`}
     </div>
     <div class="tc-meta">
       <span class="tc-tag">${ptsFmt(t.pips)} pts</span>
@@ -638,6 +643,8 @@ function tradeCard(t) {
       ${(t.mistakes || []).length ? `<span class="tc-tag">⚠️ ${t.mistakes.length} mistake${t.mistakes.length > 1 ? 's' : ''}</span>` : ''}
       ${t.lesson ? `<span class="tc-tag">📚 lesson</span>` : ''}
       ${shots.length ? `<span class="tc-tag">📸 ${shots.length}</span>` : ''}
+      ${t.wave ? `<span class="tc-tag" style="color:var(--gold)">🌊 ${esc(t.wave)}</span>` : ''}
+      ${t.running && t.rrPlanned != null ? `<span class="tc-tag" style="color:var(--gold)">🎯 plan 1:${t.rrPlanned}</span>` : ''}
       ${t.imported ? `<span class="tc-tag">🪄 auto-filled</span>` : ''}
     </div>
     ${flags.length ? `<div class="tc-meta">${flags.map(([c, txt]) => `<span class="plan-flag ${c}">${txt}</span>`).join('')}</div>` : ''}
@@ -646,6 +653,79 @@ function tradeCard(t) {
       `<img src="${sh.url}" loading="lazy" onclick="openLightboxFor('${t.id}',${i})" alt="">`).join('')}${shots.length > 3 ? `<span class="more">+${shots.length - 3}</span>` : ''}</div>` : ''}
   </div>`;
 }
+
+/* ---------------- Waves (pyramid / scale-in positions) ---------------- */
+function waveOrdered(list) {
+  // folds trades sharing a wave name into ordered render-items (waves sorted by newest leg)
+  const groups = new Map(), solo = [];
+  list.forEach(tr => {
+    if (tr.wave) {
+      const k = (tr.profileId || 'x') + '|' + tr.wave;
+      if (!groups.has(k)) groups.set(k, { name: tr.wave, legs: [] });
+      groups.get(k).legs.push(tr);
+    } else solo.push(tr);
+  });
+  const items = solo.map(tr => ({ type: 'solo', tr, key: String(tr.date) }));
+  groups.forEach(g => {
+    if (g.legs.length >= 2) items.push({ type: 'wave', name: g.name, legs: g.legs, key: g.legs.map(l => String(l.date)).sort().reverse()[0] });
+    else g.legs.forEach(tr => items.push({ type: 'solo', tr, key: String(tr.date) })); // a 1-leg wave rides as a normal card
+  });
+  return items.sort((a, b) => b.key.localeCompare(a.key));
+}
+
+function waveCard(name, legs) {
+  legs = [...legs].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const first = legs[0];
+  const closed = legs.filter(l => !l.running);
+  const totPnl = round2(closed.reduce((a, x) => a + (x.pnl || 0), 0));
+  const wR = closed.filter(l => (l.rMultiple || 0) > 0).reduce((a, x) => a + x.rMultiple, 0);
+  const lR = Math.abs(closed.filter(l => (l.rMultiple || 0) < 0).reduce((a, x) => a + x.rMultiple, 0));
+  const sumR = round2(wR - lR);
+  const blended = lR > 0 ? '1 : ' + Math.round(wR / lR * 10) / 10 : (wR > 0 ? '1 : ∞' : null);
+  const running = legs.filter(l => l.running);
+  const samePair = legs.every(l => l.pair === first.pair);
+  const shots = legs.reduce((a, x) => a + (x.screenshots || []).length, 0);
+  const roleEmoji = r => r === 'add' ? '➕' : r === 'partial' ? '➗' : '🥇';
+  const enc = encodeURIComponent(name);
+  return `<div class="wave-card">
+    <div class="wv-head">
+      <span class="wv-name">🌊 ${esc(name)}</span>
+      <span class="wv-meta">${samePair ? esc(first.pair) : 'Multi'}${first.setup ? ` · ⚡ ${esc(first.setup)}` : ''} · ${legs.length} leg${legs.length > 1 ? 's' : ''}${running.length ? ` · <span class="wv-run">🏃 ${running.length} running</span>` : ''}</span>
+      <span class="mono wv-total ${closed.length ? cls(totPnl) : ''}">${closed.length ? money(totPnl) : 'open'}</span>
+    </div>
+    <div class="wv-legs">
+      ${legs.map(l => `
+      <div class="wv-leg" onclick="openTradeForm('${l.id}')">
+        <span class="wv-role" title="${{ initial: 'initial entry', add: 'add-on', partial: 'partial close' }[l.waveRole] || 'initial entry'}">${roleEmoji(l.waveRole)}</span>
+        <span class="mono" style="min-width:56px">${l.dir === 'long' ? '▲' : '▼'} ${l.lots ?? '?'} lot</span>
+        <span class="mono" style="color:var(--muted)">${l.entry ?? '?'} → ${l.running ? '🏃 running' : (l.exit ?? '?')}</span>
+        ${holdFmt(holdMs(l)) ? `<span class="tc-tag">⏱ ${holdFmt(holdMs(l))}</span>` : ''}
+        ${l.rMultiple != null ? `<span class="tc-tag">${l.rMultiple > 0 ? '+' : ''}${l.rMultiple}R</span>` : ''}
+        ${l.running && l.rrPlanned != null ? `<span class="tc-tag wv-plan" title="planned risk:reward">🎯 1:${l.rrPlanned}</span>` : ''}
+        ${l.running && l.riskAmount != null ? `<span class="tc-tag wv-plan" title="dollars at risk if SL hits">risk $${round2(l.riskAmount)}</span>` : ''}
+        <span class="mono wv-leg-pnl ${l.running ? 'wv-run' : cls(l.pnl)}">${l.running ? '🏃' : money(l.pnl)}</span>
+      </div>`).join('')}
+    </div>
+    <div class="wv-foot">
+      ${blended ? `<span class="tc-tag">blended ${blended}</span>` : ''}
+      ${sumR ? `<span class="tc-tag">Σ ${sumR > 0 ? '+' : ''}${sumR}R</span>` : ''}
+      ${shots ? `<span class="tc-tag">📸 ${shots}</span>` : ''}
+      <span style="flex:1"></span>
+      <button class="btn btn-ghost" style="padding:5px 10px;font-size:12px" onclick="wavePrefill('${enc}','add')">＋ Add leg</button>
+      <button class="btn btn-ghost" style="padding:5px 10px;font-size:12px" onclick="wavePrefill('${enc}','partial')">➗ Partial out</button>
+    </div>
+  </div>`;
+}
+
+window.wavePrefill = (encName, role) => {
+  const name = decodeURIComponent(encName);
+  const legs = S.trades.filter(t2 => t2.wave === name);
+  const f = legs[0] || {};
+  openTradeForm(null, {
+    wave: name, waveRole: role, pair: f.pair, setup: f.setup, dir: f.dir, profileId: f.profileId,
+    running: role === 'add', analysisTF: f.analysisTF, executionTF: f.executionTF,
+  });
+};
 function fmtDate(iso) {
   const d = new Date(iso);
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
@@ -715,7 +795,7 @@ function renderJournal(t) {
         <option value="be" ${outcome === 'be' ? 'selected' : ''}>Breakeven</option>
       </select>
     </div>
-    ${list.length ? list.map(tradeCard).join('') : '<div class="empty"><div class="big">🕳️</div>Nothing here. Time to make some trades?</div>'}
+    ${list.length ? waveOrdered(list).map(it => it.type === 'wave' ? waveCard(it.name, it.legs) : tradeCard(it.tr)).join('') : '<div class="empty"><div class="big">🕳️</div>Nothing here. Time to make some trades?</div>'}
     <div style="height:8px"></div>`;
   $('#fltQ').addEventListener('input', e => { S.filters.q = e.target.value; softRefreshJournal(); });
   $('#fltOutcome').addEventListener('change', e => { S.filters.outcome = e.target.value; softRefreshJournal(); });
@@ -727,19 +807,57 @@ function softRefreshJournal() {
   if (q2 && document.activeElement !== $('#fltOutcome')) { q2.focus(); q2.setSelectionRange(pos, pos); }
 }
 
-/* ---------------- Render: gallery ---------------- */
-function allShots(t) {
-  const out = [];
-  t.forEach(tr => (tr.screenshots || []).forEach((sh, i) => out.push({ tr, sh, i })));
-  return out.sort((a, b) => b.tr.date.localeCompare(a.tr.date));
+/* ---------------- Render: gallery — Chart Book 2.0 (unique tiles · day groups · win/loss auras) ---------------- */
+function uniqueShots(t) {
+  const map = new Map(); // url → { sh, trades: [] }  (same shot on 2 trades of one setup = ONE tile)
+  t.forEach(tr => (tr.screenshots || []).forEach(sh => {
+    if (!sh.url) return;
+    if (!map.has(sh.url)) map.set(sh.url, { sh, trades: [] });
+    map.get(sh.url).trades.push(tr);
+  }));
+  return [...map.values()].map(u => {
+    u.trades.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    u.day = String(u.trades[0].date || '').slice(0, 10) || 'unknown';
+    const wins = u.trades.filter(tr => (tr.pnl || 0) > 0).length;
+    const losses = u.trades.filter(tr => (tr.pnl || 0) < 0).length;
+    u.oc = wins && !losses ? 'win' : losses && !wins ? 'loss' : (wins + losses) ? 'mixed' : 'flat';
+    return u;
+  });
+}
+function dayLabel(day) {
+  const d = new Date(day + 'T12:00:00');
+  if (isNaN(d)) return day;
+  const lbl = d.toLocaleDateString('en-US', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+  const k = t => t.toISOString().slice(0, 10);
+  const today = new Date(), yd = new Date(); yd.setDate(yd.getDate() - 1);
+  return (day === k(today) ? 'Today · ' : day === k(yd) ? 'Yesterday · ' : '') + lbl;
+}
+function cbCell(u) {
+  const tr = u.trades[0];
+  const idx = Math.max(0, (tr.screenshots || []).findIndex(s => s.url === u.sh.url));
+  const totPnl = round2(u.trades.reduce((a, x) => a + (x.pnl || 0), 0));
+  const samePair = u.trades.every(x => x.pair === u.trades[0].pair);
+  return `<button class="gal-cell oc-${u.oc}" onclick="openLightbox('${tr.id}', ${idx})" title="${esc(u.trades.map(x => `${x.pair} (${money(x.pnl)})`).join(' · '))}">
+    <img src="${u.sh.url}" loading="lazy" alt="">
+    <span class="gal-outcome">${{ win: '🏆', loss: '🩸', mixed: '🤝', flat: '◻️' }[u.oc]}</span>
+    <span class="gal-cat">${SHOT_CAT_EMOJI[u.sh.cat] || '📷'} ${esc(u.sh.cat || 'Chart')}</span>
+    <div class="gal-ov">
+      <span>${esc(samePair ? u.trades[0].pair : 'Multi')}${u.trades.length > 1 ? ` ×${u.trades.length}` : ''}</span>
+      <span class="${cls(totPnl)}">${money(totPnl)}</span>
+    </div>
+  </button>`;
 }
 function renderGallery(t) {
   const el = $('#page-gallery');
-  const shots = allShots(t);
-  const filtered = S.galCat === 'All' ? shots : shots.filter(x => x.sh.cat === S.galCat);
+  const uniq = uniqueShots(t);
+  let list = S.galCat === 'All' ? uniq : uniq.filter(u => u.sh.cat === S.galCat);
+  if (S.galOutcome !== 'all') list = list.filter(u => u.oc === S.galOutcome);
+  const days = {};
+  list.forEach(u => (days[u.day] = days[u.day] || []).push(u));
+  const dayKeys = Object.keys(days).sort((a, b) => b.localeCompare(a));
   el.innerHTML = `
-    <div class="page-title">Chart Book 🖼️ <small>${shots.length} screenshots · ${viewLabel()} · your setups, in HD</small></div>
-    ${shots.length ? `
+    <div class="page-title">Chart Book 🖼️ <small>${uniq.length} unique charts · ${Object.keys(days).length || '0'} days · ${viewLabel()} · your setups, in HD</small></div>
+    ${uniq.length ? `
     <div class="filters">
       <select id="galCat">
         <option ${S.galCat === 'All' ? 'selected' : ''}>All</option>
@@ -747,31 +865,41 @@ function renderGallery(t) {
       </select>
       <select id="galOutcome">
         <option value="all" ${S.galOutcome === 'all' ? 'selected' : ''}>All outcomes</option>
-        <option value="win" ${S.galOutcome === 'win' ? 'selected' : ''}>Wins</option>
-        <option value="loss" ${S.galOutcome === 'loss' ? 'selected' : ''}>Losses</option>
+        <option value="win" ${S.galOutcome === 'win' ? 'selected' : ''}>🏆 Wins only</option>
+        <option value="loss" ${S.galOutcome === 'loss' ? 'selected' : ''}>🩸 Losses only</option>
+        <option value="mixed" ${S.galOutcome === 'mixed' ? 'selected' : ''}>🤝 Mixed setups</option>
       </select>
     </div>
-    <div class="gal-grid" id="galGrid"></div>` : `
+    <div id="cbDays"></div>` : `
     <div class="empty"><div class="big">📸</div><b>Your chart book is empty.</b><br><br>
       Screenshot your analysis before entry, the setup at entry, and the outcome.<br>
       Months from now this page is gold: spot your repeating patterns, your best setups, your classic mistakes.<br><br>
       <button class="btn btn-primary" onclick="openAddChooser()">Add a trade with charts</button>
     </div>`}
     <div style="height:8px"></div>`;
-  if (!shots.length) return;
-  let list = filtered;
-  if (S.galOutcome !== 'all') list = list.filter(x => outcomeOf(x.tr) === S.galOutcome);
+  if (!uniq.length) return;
   $('#galCat').onchange = e => { S.galCat = e.target.value; renderGallery(viewTrades()); };
   $('#galOutcome').onchange = e => { S.galOutcome = e.target.value; renderGallery(viewTrades()); };
-  $('#galGrid').innerHTML = list.map(({ tr, sh, i }) => `
-    <button class="gal-cell" onclick="openLightbox('${tr.id}', ${i})">
-      <img src="${sh.url}" loading="lazy" alt="">
-      <span class="gal-cat">${SHOT_CAT_EMOJI[sh.cat] || '📷'} ${esc(sh.cat || 'Chart')}</span>
-      <div class="gal-ov">
-        <span>${esc(tr.pair)}</span>
-        <span class="${cls(tr.pnl)}">${money(tr.pnl)}</span>
-      </div>
-    </button>`).join('') || '<div class="empty" style="grid-column:1/-1">No shots in this filter.</div>';
+  $('#cbDays').innerHTML = dayKeys.map(day => {
+    const us = days[day];
+    const ids = new Set(us.flatMap(u => u.trades.map(tr => tr.id)));
+    const dayTrades = t.filter(x => ids.has(x.id));
+    const dayPnl = round2(dayTrades.reduce((a, x) => a + (x.pnl || 0), 0));
+    const setups = [...new Set(dayTrades.map(x => x.setup).filter(Boolean))];
+    return `<div class="cb-day">
+      <button class="cb-day-hdr" onclick="this.parentNode.classList.toggle('closed')">
+        <span class="cb-toggle">▾</span>
+        <span class="cb-day-name">${dayLabel(day)}</span>
+        <span class="cb-day-meta">
+          <span class="mono ${cls(dayPnl)}" style="font-weight:800">${money(dayPnl)}</span>
+          <span>${dayTrades.length} trade${dayTrades.length > 1 ? 's' : ''}</span>
+          <span>${us.length} chart${us.length > 1 ? 's' : ''}</span>
+          ${setups.length ? `<span>⚡ ${esc(setups.slice(0, 2).join(' + '))}${setups.length > 2 ? '…' : ''}</span>` : ''}
+        </span>
+      </button>
+      <div class="gal-grid">${us.map(cbCell).join('')}</div>
+    </div>`;
+  }).join('') || '<div class="empty" style="grid-column:1/-1">Nothing under these filters.</div>';
 }
 window.openLightboxFor = (tradeId, shotIdx) => openLightbox(tradeId, shotIdx);
 window.openLightbox = (tradeId, shotIdx) => {
@@ -1554,6 +1682,15 @@ async function uploadStagedShots(shots) {
 window.afImportAll = async () => {
   const fresh = S.af.drafts.filter(d => !d.dup);
   if (!fresh.length) return;
+  // same-pair, same-day drafts from one batch = one wave (pyramid family) — auto-stitch
+  const byPk = {};
+  fresh.forEach(d => { const k = d.pair + '|' + String(d.date).slice(0, 10); (byPk[k] = byPk[k] || []).push(d); });
+  Object.values(byPk).forEach(g => {
+    if (g.length < 2) return;
+    g.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const wn = `${g[0].pair} · ${new Date(g[0].date).toLocaleDateString('en-US', { day: 'numeric', month: 'short' })}`;
+    g.forEach((d, i) => { d.wave = wn; d.waveRole = i === 0 ? 'initial' : 'add'; });
+  });
   const defProfile = S.view !== 'all' ? S.view : S.profiles[0].id;
   let done = 0, shotsAttached = 0;
   for (const d of fresh) {
@@ -1566,6 +1703,7 @@ window.afImportAll = async () => {
       riskAmount: d.riskAmount, rMultiple: d.rMultiple, rrPlanned: d.rrPlanned,
       session: blockFromHour(date.getHours()), setup: d.setup || '',
       rules: {}, mistakes: [], lesson: '', notes: '', screenshots: [],
+      wave: d.wave || null, waveRole: d.waveRole || null,
       imported: true,
     };
     if (d._shots && d._shots.length) {
@@ -1581,6 +1719,11 @@ window.afImportAll = async () => {
 };
 
 /* ---------------- Trade form ---------------- */
+function waveDatalist() {
+  const names = [...new Set(S.trades.map(x => x.wave).filter(Boolean))];
+  return `<datalist id="wavesList">${names.map(w => `<option>${esc(w)}</option>`).join('')}</datalist>`;
+}
+
 let formDir = 'long';
 let shotsTmp = [];
 let shotsBusy = 0;
@@ -1630,6 +1773,7 @@ window.openTradeForm = (id, prefill) => {
           <div class="field"><label>Lot size</label><input type="number" step="any" id="f-lots" placeholder="1" required value="${v('lots') || 1}"></div>
           <div class="field"><label>Entry price (actual)</label><input type="number" step="any" id="f-entry" required value="${v('entry')}"></div>
           <div class="field"><label>Exit price (actual)</label><input type="number" step="any" id="f-exit" required value="${v('exit')}"></div>
+          <div class="field full" style="margin-top:2px"><label class="runchk"><input type="checkbox" id="f-running" ${t && t.running ? 'checked' : ''}> 🏃 <b>Still running</b> — no exit yet · journal shows planned R:R + $-at-risk until you close it</label></div>
         </div>
 
         <div class="sec-label">🎯 The plan <span style="color:var(--muted);text-transform:none;font-weight:500">— so the journal can check if you followed it</span></div>
@@ -1657,6 +1801,11 @@ window.openTradeForm = (id, prefill) => {
             ${v('session') && !TIME_BLOCKS.includes(v('session')) ? `<option selected>${esc(v('session'))}</option>` : ''}</select></div>
           <div class="field"><label>Timeframe — analysis</label>${tfSel('f-atf', v('analysisTF'))}</div>
           <div class="field"><label>Timeframe — execution</label>${tfSel('f-etf', v('executionTF'))}</div>
+          <div class="field"><label>🌊 Wave / position <span style="opacity:.6">(pyramid family, optional)</span></label>
+            <input id="f-wave" list="wavesList" placeholder="e.g. FX Vol 60 short · 22 Sep" value="${esc(v('wave') || '')}">${waveDatalist()}</div>
+          <div class="field"><label>Leg role</label>
+            <select id="f-waveRole">${[['initial', '🥇 Initial entry'], ['add', '➕ Add-on / scale-in'], ['partial', '➗ Partial close']].map(([r, lbl]) => `<option value="${r}" ${(v('waveRole') || 'initial') === r ? 'selected' : ''}>${lbl}</option>`).join('')}</select>
+            <span class="hint">Same wave name stitches legs into one position card.</span></div>
           <div class="field full"><label>Setup quality</label>
             <div class="stars" id="f-stars">${[1, 2, 3, 4, 5].map(i => `<button type="button" data-star="${i}" class="${(v('rating') || 0) >= i ? 'lit' : ''}">⭐</button>`).join('')}</div>
             <input type="hidden" id="f-rating" value="${v('rating') || 0}"></div>
@@ -1861,8 +2010,12 @@ window.saveTrade = async (e, id) => {
     rules, mistakes: $$('#mistakeChips .chip-toggle.on-neg').map(x => x.dataset.mistake),
     lesson: $('#f-lesson').value.trim(), notes: $('#f-notes').value.trim(),
     screenshots: shotsTmp.filter(s => s.url),
+    wave: $('#f-wave') ? ($('#f-wave').value.trim() || null) : null,
+    waveRole: $('#f-waveRole') ? $('#f-waveRole').value : null,
+    running: !!($('#f-running') && $('#f-running').checked),
   };
-  if (trade.pnl == null) return toast('⚠️ Need entry & exit (or a manual P&L)');
+  if (trade.running) { trade.exit = null; trade.pnl = null; } // a runner has no outcome yet — the plan is the story
+  if (!trade.running && trade.pnl == null) return toast('⚠️ Need entry & exit (or a manual P&L) — or tick 🏃 Still running');
   try {
     if (id) {
       await api('/api/trade/' + id, 'POST', trade);

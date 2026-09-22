@@ -354,6 +354,38 @@ input, select, textarea { font: inherit; }
 .upload-drop .big { font-size: 22px; display: block; margin-bottom: 4px; }
 .shot-uploading { opacity: .5; pointer-events: none; }
 
+/* ============ Chart Book 2.0 (day groups + outcome auras) ============ */
+.cb-day { margin: 16px 0 6px; }
+.cb-day-hdr { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; color: var(--text); cursor: pointer; font: inherit; }
+.cb-day-hdr:hover { border-color: var(--lime); }
+.cb-toggle { color: var(--muted); transition: transform .18s ease; }
+.cb-day.closed .cb-toggle { transform: rotate(-90deg); }
+.cb-day.closed .gal-grid { display: none; }
+.cb-day-name { font-weight: 800; font-size: 13px; white-space: nowrap; }
+.cb-day-meta { display: flex; gap: 10px; margin-left: auto; font-size: 11px; color: var(--muted); flex-wrap: wrap; justify-content: flex-end; align-items: center; }
+.cb-day .gal-grid { margin-top: 8px; }
+.gal-cell.oc-win { border-color: rgba(132,204,22,.6); box-shadow: 0 0 0 1px rgba(132,204,22,.35), 0 4px 20px rgba(132,204,22,.14); }
+.gal-cell.oc-loss { border-color: rgba(239,68,68,.6); box-shadow: 0 0 0 1px rgba(239,68,68,.35), 0 4px 20px rgba(239,68,68,.14); }
+.gal-cell.oc-mixed { border-color: rgba(251,191,36,.6); box-shadow: 0 0 0 1px rgba(251,191,36,.4), 0 4px 20px rgba(251,191,36,.14); }
+.gal-outcome { position: absolute; top: 6px; right: 6px; font-size: 13px; background: rgba(4,6,10,.78); padding: 3px 6px; border-radius: 7px; }
+
+/* ============ Waves (pyramid / scale-in positions) ============ */
+.wave-card { background: var(--card); border: 1px solid rgba(251,191,36,.45); border-radius: var(--radius); padding: 12px 14px; margin-top: 10px; }
+.wv-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.wv-name { font-weight: 800; font-size: 14px; }
+.wv-meta { font-size: 11px; color: var(--muted); }
+.wv-total { margin-left: auto; font-weight: 800; font-size: 15px; }
+.wv-legs { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; }
+.wv-leg { display: flex; align-items: center; gap: 8px; background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; font-size: 12px; cursor: pointer; flex-wrap: wrap; }
+.wv-leg:hover { border-color: var(--lime); }
+.wv-role { font-size: 14px; }
+.wv-leg-pnl { margin-left: auto; font-weight: 800; }
+.wv-run { color: var(--gold); font-weight: 700; }
+.wv-plan { color: var(--gold); }
+.wv-foot { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+.runchk { font-weight: 500 !important; display: flex; align-items: center; gap: 9px; cursor: pointer; text-transform: none !important; letter-spacing: normal !important; font-size: 13px; }
+.runchk input { width: 16px; height: 16px; accent-color: var(--lime); }
+
 .plan-flag { font-size: 11px; border-radius: 8px; padding: 3px 8px; font-weight: 700; }
 .plan-flag.ok { background: var(--green-dim); color: var(--green); }
 .plan-flag.bad { background: var(--red-dim); color: var(--red); }
