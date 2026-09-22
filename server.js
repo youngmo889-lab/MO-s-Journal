@@ -117,6 +117,45 @@ function decodeVaultShots(files) {
   state.meta.vaultedShots = [...vaulted];
   if (n) console.log(`🖼️  Pixel Vault: ${n} screenshot(s) resurrected from gist`);
 }
+/* ---- Pixel Vault alt-route (Cloudinary) — optional; env-configured only, zero deps ---- */
+const CLOUD = {
+  name: process.env.CLOUDINARY_CLOUD_NAME || '',
+  key: process.env.CLOUDINARY_API_KEY || '',
+  secret: process.env.CLOUDINARY_API_SECRET || '',
+};
+const cloudReady = () => !!(CLOUD.name && CLOUD.key && CLOUD.secret);
+function cloudUpload(buf, filename, mime) {
+  return new Promise((resolve, reject) => {
+    const ts = Math.floor(Date.now() / 1000);
+    const sig = crypto.createHash('sha1').update(`timestamp=${ts}${CLOUD.secret}`).digest('hex');
+    const boundary = '----mojournal' + Date.now().toString(16) + crypto.randomBytes(6).toString('hex');
+    const parts = [];
+    for (const [k, v] of Object.entries({ api_key: CLOUD.key, timestamp: String(ts), signature: sig })) {
+      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
+    }
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${String(filename).replace(/"/g, '')}"\r\nContent-Type: ${mime || 'image/jpeg'}\r\n\r\n`));
+    parts.push(buf);
+    parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+    const body = Buffer.concat(parts);
+    const r2 = https.request({
+      hostname: 'api.cloudinary.com', port: 443, path: `/v1_1/${CLOUD.name}/image/upload`, method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length }, timeout: 30000,
+    }, (res2) => {
+      const chunks = []; res2.on('data', (c) => chunks.push(c));
+      res2.on('end', () => {
+        try {
+          const j = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          j.secure_url ? resolve(j.secure_url) : reject(new Error((j.error && j.error.message) || 'cloudinary rejected'));
+        } catch (e) { reject(e); }
+      });
+    });
+    r2.on('error', reject);
+    r2.on('timeout', () => r2.destroy(new Error('cloudinary timeout')));
+    r2.end(body);
+  });
+}
+
+
 async function gh(url, opts = {}) {
   const r = await fetch(url, {
     ...opts,
@@ -324,12 +363,24 @@ const server = http.createServer(async (req, res) => {
       const cfg = aiCfg();
       if (!cfg.key) return send(res, 400, { ok: false, error: 'NO_KEY', message: 'No AI key configured yet.' });
       try {
-        const r = await fetch(cfg.base + '/models', {
+        // OpenRouter's /models is PUBLIC — a dead key would still "connect".
+        // /auth/key is the truth: 401 here = the key/account itself is rejected.
+        const isOR = /openrouter\.ai/.test(cfg.base);
+        const r = await fetch(cfg.base + (isOR ? '/auth/key' : '/models'), {
           headers: { 'Authorization': 'Bearer ' + cfg.key },
           signal: AbortSignal.timeout(20000),
         });
-        if (!r.ok) return send(res, 400, { ok: false, error: 'AI_FAIL', message: `Provider rejected the key (${r.status}).` });
-        return send(res, 200, { ok: true, message: `Connected ✓ using ${cfg.model}` });
+        if (!r.ok) {
+          const txt = await r.text().catch(() => '');
+          const notFound = /user not found/i.test(txt);
+          return send(res, 400, {
+            ok: false, error: 'AI_AUTH',
+            message: notFound
+              ? '"User not found" — this key belongs to a deleted/changed OpenRouter account. Open openrouter.ai/keys while SIGNED IN (check the email top-right), mint a FRESH key, paste & Save here.'
+              : `Provider rejected the key (${r.status}) — mint a fresh key from your provider, paste & Save.`,
+          });
+        }
+        return send(res, 200, { ok: true, message: `Connected ✓ key verified using ${cfg.model}` });
       } catch (e) { return send(res, 400, { ok: false, error: 'AI_FAIL', message: 'Could not reach provider: ' + e.message }); }
     }
 
@@ -347,8 +398,9 @@ const server = http.createServer(async (req, res) => {
       // lane-hopping: free-model pools congest (429) and retire (404) — rotate until one answers.
       const laneHop = /openrouter\.ai|localhost|127\.0\.0\.1/.test(cfg.base);
       const chain = [cfg.model, ...(laneHop ? FREE_VISION_FALLBACK : [])].filter((m, i, a) => m && a.indexOf(m) === i);
-      let lastErr = '';
+      let lastErr = '', tried = 0, authFail = false;
       for (const model of chain) {
+        tried++;
         try {
           const r = await fetch(cfg.base + '/chat/completions', {
             method: 'POST',
@@ -370,58 +422,19 @@ const server = http.createServer(async (req, res) => {
           }
           const t = await r.text();
           lastErr = `AI error ${r.status}: ${t.slice(0, 250)}`;
-          if (r.status === 401 || r.status === 402 || r.status === 403) break; // auth/billing — no lane helps
+          if (r.status === 401 || r.status === 402 || r.status === 403) { authFail = true; break; } // auth/billing — no lane helps
           // 404 (model retired) / 429 (lane busy) / 5xx (flake) → next lane
         } catch (e) {
           lastErr = e.name === 'TimeoutError' ? 'AI took too long — try fewer/smaller images.' : e.message;
         }
       }
       return send(res, 400, {
-        ok: false, error: 'AI_FAIL', lanesTried: chain.length,
-        message: lastErr + (chain.length > 1 ? ` — tried ${chain.length} free lanes, all busy. Wait ~60 seconds and press Analyze again; don't change any settings.` : ''),
+        ok: false, error: authFail ? 'AI_AUTH' : 'AI_FAIL', lanesTried: tried,
+        message: authFail
+          ? lastErr + ' — 🔑 KEY REJECTED by the provider ("User not found" = the key/account itself). This is NOT congestion — waiting won\'t fix it. Open your provider while SIGNED IN (check the email top-right), mint a FRESH key, paste it in ⚙️ → AI AUTO-FILL, press 🔌 Test, then Analyze again.'
+          : lastErr + (tried > 1 ? ` — tried ${tried} free lanes, all busy. Wait ~60 seconds and press Analyze again; don't change any settings.` : ''),
       });
     }
-
-/* ---- Pixel Vault (Cloudinary) — optional; when env-configured, screenshots
-       fly to permanent cloud URLs instead of the ephemeral tent disk ---- */
-const CLOUD = {
-  name: process.env.CLOUDINARY_CLOUD_NAME || '',
-  key: process.env.CLOUDINARY_API_KEY || '',
-  secret: process.env.CLOUDINARY_API_SECRET || '',
-};
-const cloudReady = () => !!(CLOUD.name && CLOUD.key && CLOUD.secret);
-function cloudUpload(buf, filename, mime) {
-  return new Promise((resolve, reject) => {
-    const ts = Math.floor(Date.now() / 1000);
-    const sig = crypto.createHash('sha1').update(`timestamp=${ts}${CLOUD.secret}`).digest('hex');
-    const boundary = '----mojournal' + Date.now().toString(16) + crypto.randomBytes(6).toString('hex');
-    const parts = [];
-    for (const [k, v] of Object.entries({ api_key: CLOUD.key, timestamp: String(ts), signature: sig })) {
-      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
-    }
-    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${String(filename).replace(/"/g, '')}"\r\nContent-Type: ${mime || 'image/jpeg'}\r\n\r\n`));
-    parts.push(buf);
-    parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
-    const body = Buffer.concat(parts);
-    const r2 = https.request({
-      hostname: 'api.cloudinary.com', port: 443, path: `/v1_1/${CLOUD.name}/image/upload`, method: 'POST',
-      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length }, timeout: 30000,
-    }, (res2) => {
-      const chunks = []; res2.on('data', (c) => chunks.push(c));
-      res2.on('end', () => {
-        try {
-          const j = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-          j.secure_url ? resolve(j.secure_url) : reject(new Error((j.error && j.error.message) || 'cloudinary rejected'));
-        } catch (e) { reject(e); }
-      });
-    });
-    r2.on('error', reject);
-    r2.on('timeout', () => r2.destroy(new Error('cloudinary timeout')));
-    r2.end(body);
-  });
-}
-
-
     if (p === '/api/upload' && req.method === 'POST') {
       const body = await readBody(req);
       const b64 = String(body.data || '').replace(/^data:image\/\w+;base64,/, '');
@@ -429,8 +442,10 @@ function cloudUpload(buf, filename, mime) {
       if (!buf.length) return send(res, 400, { ok: false, error: 'empty image' });
       if (buf.length > 9e6) return send(res, 413, { ok: false, error: 'image too large' });
       const ext = (body.ext || '.jpg').replace(/[^\w.]/g, '').slice(0, 6) || '.jpg';
-      const name = crypto.randomUUID() + ext;
-      fs.writeFileSync(path.join(UPLOADS, name), buf);
+      // content-fingerprint filename: the same image always lands on the same file —
+      // duplicate uploads across trades fold into ONE canonical copy (kills Chart Book overcrowding)
+      const name = crypto.createHash('sha256').update(buf).digest('hex').slice(0, 24) + ext;
+      if (!fs.existsSync(path.join(UPLOADS, name))) fs.writeFileSync(path.join(UPLOADS, name), buf);
       let url = '/uploads/' + name;
       if (cloudReady()) {
         try {
