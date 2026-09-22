@@ -83,6 +83,40 @@ function scheduleSave() {
 }
 
 const gist = { enabled: false, id: null };
+/* ---- Pixel Vault (via the Gist you already own) ----
+   Screenshots ride the same gist as img_<name> base64 files. Local disk is the
+   fast cache; the gist is the immortal copy. No extra accounts, no extra tokens. */
+const SHOT_EXT = /\.(jpe?g|png|webp|gif)$/i;
+function ensureVaultMeta() {
+  state.meta = state.meta || {};
+  if (!Array.isArray(state.meta.vaultedShots)) state.meta.vaultedShots = [];
+  return state.meta.vaultedShots;
+}
+function pendingShots() {
+  const vaulted = new Set(ensureVaultMeta());
+  try {
+    return fs.readdirSync(UPLOADS)
+      .filter(n => SHOT_EXT.test(n) && !vaulted.has(n))
+      .map(n => ({ name: n, size: fs.statSync(path.join(UPLOADS, n)).size }))
+      .filter(s => s.size > 0 && s.size < 3e6); // skip monsters
+  } catch { return []; }
+}
+function decodeVaultShots(files) {
+  const vaulted = new Set(ensureVaultMeta());
+  let n = 0;
+  for (const [fname, f] of Object.entries(files || {})) {
+    if (!fname.startsWith('img_') || !f || !f.content || f.truncated) continue;
+    const name = fname.slice(4);
+    if (!SHOT_EXT.test(name)) continue;
+    try {
+      fs.mkdirSync(UPLOADS, { recursive: true });
+      fs.writeFileSync(path.join(UPLOADS, name), Buffer.from(String(f.content).replace(/\s+/g, ''), 'base64'));
+      vaulted.add(name); n++;
+    } catch (e) { console.error('vault shot decode failed:', fname, e.message); }
+  }
+  state.meta.vaultedShots = [...vaulted];
+  if (n) console.log(`🖼️  Pixel Vault: ${n} screenshot(s) resurrected from gist`);
+}
 async function gh(url, opts = {}) {
   const r = await fetch(url, {
     ...opts,
@@ -106,6 +140,7 @@ async function gistBoot() {
       const full = await gh('https://api.github.com/gists/' + found.id);
       const content = full.files[GIST_FILE] && full.files[GIST_FILE].content;
       if (content && content.length > 10) state = migrate(JSON.parse(content));
+      decodeVaultShots(full.files);
       console.log('☁️  Gist sync: ON (existing backup found)');
     } else {
       console.log('☁️  Gist sync: ON (backup gist will be created on first save)');
@@ -121,23 +156,41 @@ function scheduleGistSave() {
   clearTimeout(gistTimer);
   gistTimer = setTimeout(async () => {
     try {
-      const content = JSON.stringify(state);
+      const files = { [GIST_FILE]: { content: JSON.stringify(state) } };
+      // sweep new screenshots into the vault ride-along (max ~25MB per sweep)
+      const swept = [];
+      let bytes = 0;
+      for (const s of pendingShots()) {
+        if (bytes + s.size > 25e6) break;
+        try {
+          files['img_' + s.name] = { content: fs.readFileSync(path.join(UPLOADS, s.name)).toString('base64') };
+          swept.push(s.name); bytes += s.size;
+        } catch {}
+      }
       if (gist.id) {
         await gh('https://api.github.com/gists/' + gist.id, {
           method: 'PATCH',
-          body: JSON.stringify({ files: { [GIST_FILE]: { content } } }),
+          body: JSON.stringify({ files }),
         });
       } else {
         const g = await gh('https://api.github.com/gists', {
           method: 'POST',
           body: JSON.stringify({
-            description: "Mo's Journal — data backup (auto-managed, do not delete)",
+            description: "Mo's Journal — data + screenshot backup (auto-managed, do not delete)",
             public: false,
-            files: { [GIST_FILE]: { content } },
+            files,
           }),
         });
         gist.id = g.id;
         console.log('☁️  Backup gist created:', g.html_url);
+      }
+      if (swept.length) {
+        const vaulted = new Set(ensureVaultMeta());
+        swept.forEach(n => vaulted.add(n));
+        state.meta.vaultedShots = [...vaulted];
+        console.log(`🖼️  Pixel Vault: ${swept.length} screenshot(s) backed up to gist (${Math.round(bytes / 1024)}KB)`);
+        // persist the manifest immediately so a crash can't double-upload
+        try { fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(state, null, 2)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); } catch {}
       }
     } catch (e) { console.log('gist save failed:', e.message); }
   }, 8000);
@@ -188,7 +241,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, pub);
     }
     if (p === '/api/meta' && req.method === 'GET') {
-      return send(res, 200, { version: 4, gistSync: gist.enabled, aiConfigured: !!aiCfg().key });
+      return send(res, 200, { version: 4, gistSync: gist.enabled, aiConfigured: !!aiCfg().key, pixelVault: cloudReady() || gist.enabled, shotsVaulted: ensureVaultMeta().length });
     }
 
     if (p === '/api/trade' && req.method === 'POST') {
@@ -329,6 +382,46 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+/* ---- Pixel Vault (Cloudinary) — optional; when env-configured, screenshots
+       fly to permanent cloud URLs instead of the ephemeral tent disk ---- */
+const CLOUD = {
+  name: process.env.CLOUDINARY_CLOUD_NAME || '',
+  key: process.env.CLOUDINARY_API_KEY || '',
+  secret: process.env.CLOUDINARY_API_SECRET || '',
+};
+const cloudReady = () => !!(CLOUD.name && CLOUD.key && CLOUD.secret);
+function cloudUpload(buf, filename, mime) {
+  return new Promise((resolve, reject) => {
+    const ts = Math.floor(Date.now() / 1000);
+    const sig = crypto.createHash('sha1').update(`timestamp=${ts}${CLOUD.secret}`).digest('hex');
+    const boundary = '----mojournal' + Date.now().toString(16) + crypto.randomBytes(6).toString('hex');
+    const parts = [];
+    for (const [k, v] of Object.entries({ api_key: CLOUD.key, timestamp: String(ts), signature: sig })) {
+      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
+    }
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${String(filename).replace(/"/g, '')}"\r\nContent-Type: ${mime || 'image/jpeg'}\r\n\r\n`));
+    parts.push(buf);
+    parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+    const body = Buffer.concat(parts);
+    const r2 = https.request({
+      hostname: 'api.cloudinary.com', port: 443, path: `/v1_1/${CLOUD.name}/image/upload`, method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length }, timeout: 30000,
+    }, (res2) => {
+      const chunks = []; res2.on('data', (c) => chunks.push(c));
+      res2.on('end', () => {
+        try {
+          const j = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          j.secure_url ? resolve(j.secure_url) : reject(new Error((j.error && j.error.message) || 'cloudinary rejected'));
+        } catch (e) { reject(e); }
+      });
+    });
+    r2.on('error', reject);
+    r2.on('timeout', () => r2.destroy(new Error('cloudinary timeout')));
+    r2.end(body);
+  });
+}
+
+
     if (p === '/api/upload' && req.method === 'POST') {
       const body = await readBody(req);
       const b64 = String(body.data || '').replace(/^data:image\/\w+;base64,/, '');
@@ -338,7 +431,17 @@ const server = http.createServer(async (req, res) => {
       const ext = (body.ext || '.jpg').replace(/[^\w.]/g, '').slice(0, 6) || '.jpg';
       const name = crypto.randomUUID() + ext;
       fs.writeFileSync(path.join(UPLOADS, name), buf);
-      return send(res, 200, { ok: true, url: '/uploads/' + name });
+      let url = '/uploads/' + name;
+      if (cloudReady()) {
+        try {
+          url = await cloudUpload(buf, body.name || name, (body.type || '').startsWith('image/') ? body.type : 'image/jpeg');
+          try { fs.unlinkSync(path.join(UPLOADS, name)); } catch (_) {} // tent copy goes — the cloud carries it now
+          console.log('☁️ screenshot vaulted to cloud');
+        } catch (e) {
+          console.error('☁️ cloud upload failed, keeping tent copy:', e.message);
+        }
+      }
+      return send(res, 200, { ok: true, url, cloud: url.startsWith('http') });
     }
 
     if (p === '/api/import' && req.method === 'POST') {
