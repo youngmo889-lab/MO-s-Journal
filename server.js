@@ -33,6 +33,7 @@ function aiCfg() {
     key: process.env.AI_KEY || s.key || '',
   };
 }
+const keyHint = k => (k && k.length > 10) ? (k.slice(0, 6) + '\u2026' + k.slice(-4)) : (k ? '[short key!]' : '[none]');
 function aiHeaders(cfg) {
   const h = {
     'Authorization': 'Bearer ' + cfg.key,
@@ -48,6 +49,7 @@ const maskAI = ai => ({
   base: ai?.base || 'https://openrouter.ai/api/v1',
   model: ai?.model || 'google/gemma-4-31b-it:free',
   key: '',
+  keyHint: keyHint(process.env.AI_KEY || ai?.key || ''),
   configured: !!(process.env.AI_KEY || ai?.key),
 });
 const AI_EXTRACT_PROMPT = `You are the extraction engine of a trading journal. Read the broker screenshot(s)/history and return ONLY a JSON object (no markdown, no prose):
@@ -414,7 +416,7 @@ const server = http.createServer(async (req, res) => {
               : `Key rejected by provider (${r.status}): ${txt.slice(0, 160)} — re-check the key or mint a fresh one, then Save & Test again.`,
           });
         }
-        return send(res, 200, { ok: true, message: `Connected ✓ key verified using ${cfg.model}` });
+        return send(res, 200, { ok: true, message: `Connected ✓ key verified (${keyHint(cfg.key)}) using ${cfg.model}` });
       } catch (e) { return send(res, 400, { ok: false, error: 'AI_FAIL', message: 'Could not reach provider: ' + e.message }); }
     }
 
@@ -462,7 +464,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 400, {
         ok: false, error: authFail ? 'AI_AUTH' : 'AI_FAIL', lanesTried: tried,
         message: authFail
-          ? lastErr + ' — 🔑 KEY REJECTED by the provider ("User not found" = the key/account itself). This is NOT congestion — waiting won\'t fix it. Open your provider while SIGNED IN (check the email top-right), mint a FRESH key, paste it in ⚙️ → AI AUTO-FILL, press 🔌 Test, then Analyze again.'
+          ? lastErr + ` (key sent: ${keyHint(cfg.key)})` + ' — 🔑 KEY REJECTED by the provider ("User not found" = the key/account itself). This is NOT congestion — waiting won\'t fix it. Open your provider while SIGNED IN (check the email top-right), mint a FRESH key, paste it in ⚙️ → AI AUTO-FILL, press 🔌 Test, then Analyze again.'
           : lastErr + (tried > 1 ? ` — tried ${tried} free lanes, all busy. Wait ~60 seconds and press Analyze again; don't change any settings.` : ''),
       });
     }

@@ -1115,7 +1115,7 @@ function renderSettings() {
           <span class="hint" id="aiPresetHint">Pick one — free tiers at ${AI_PRESETS[0].hint} or ${AI_PRESETS[1].hint}</span></div>
         <div class="field"><label>API base URL</label><input id="ai-base" value="${esc(ai.base || AI_PRESETS[0].base)}"></div>
         <div class="field"><label>Model (needs vision 👁️)</label><input id="ai-model" value="${esc(ai.model || AI_PRESETS[0].model)}"></div>
-        <div class="field full"><label>API key ${ai.configured ? '<span class="pos">✓ saved — paste a new one to replace</span>' : ''}</label>
+        <div class="field full"><label>API key ${ai.configured ? `<span class="pos">✓ saved <b class="mono">${esc(ai.keyHint || '')}</b> — paste a new one to replace</span>` : ''}</label>
           <input id="ai-key" type="password" placeholder="sk-or-… / gsk_…" autocomplete="off"></div>
       </div>
       <div class="chips mt">
