@@ -83,6 +83,7 @@ Rules:
 - Do not summarise, skip rows, merge rows, or add commentary.
 - Do not invent or guess any value. If a character is uncertain, write your best reading followed by ?.
 - Include headers, times, symbols, prices, volumes, profit/loss figures and any on-chart labels.
+- Separate columns with two spaces so prices stay distinguishable. Never merge two numbers into one.
 Output plain text only — no markdown, no explanation.`;
 
 const AI_EXTRACT_PROMPT = `You are the extraction engine of a trading journal. Read the broker screenshot(s)/history and return ONLY a JSON object (no markdown, no prose):
@@ -583,7 +584,9 @@ const server = http.createServer(async (req, res) => {
         content[0].text += `\n\n===== EXACT TEXT TRANSCRIBED FROM THE SCREENSHOT(S) =====\n${transcript.slice(0, 12000)}\n===== END TRANSCRIPTION =====\n`
           + 'Extract strictly from the transcription above. Copy every number EXACTLY as written (digit for digit, same decimal places). '
           + 'Do NOT round, convert, recalculate or "correct" any value. Use null for anything absent. '
-          + 'If the transcription contains no trade data, return {"trades":[]}. Do not invent trades.';
+          + 'If the transcription contains no trade data, return {"trades":[]}. Do not invent trades.'
+          + 'SELF-CHECK before answering: every number you return MUST appear verbatim in the transcription above. '
+          + 'If you cannot find a value written there, return null for it — never estimate, average or fill it in.'
       } else if (shotParts.length) {
         content.push(...shotParts); // OCR unusable — let the model look at the images directly
       }
@@ -608,7 +611,7 @@ const server = http.createServer(async (req, res) => {
           const r = await fetch(cfg.base + '/chat/completions', {
             method: 'POST',
             headers: aiHeaders(cfg),
-            body: JSON.stringify({ model, messages: [{ role: 'user', content }], temperature: 0.1, max_tokens: 3000 }),
+            body: JSON.stringify({ model, messages: [{ role: 'user', content }], temperature: 0, max_tokens: 3000 }), // v4.6.5: zero temperature — no creative drift on numbers
             signal: AbortSignal.timeout(90000),
           });
           if (r.ok) {

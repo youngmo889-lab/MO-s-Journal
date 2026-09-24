@@ -1421,7 +1421,7 @@ window.openAddChooser = () => {
 };
 
 const AF_MAX_SHOTS = 12;   // AUTO-FILL batch ceiling — parsed in rounds of 4 (free-tier vision safe)
-const AF_BATCH = 4;
+const AF_BATCH = 2;   // v4.6.5: fewer images per request = more model attention per shot = fewer misread digits
 
 window.openAutofill = () => {
   S.af = { method: null, images: [], text: '', hint: '', drafts: null, busy: false, status: '', via: '' };
