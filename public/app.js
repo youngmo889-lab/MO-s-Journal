@@ -1116,7 +1116,9 @@ function renderSettings() {
           <span class="hint" id="aiPresetHint">Pick one — free tiers at ${AI_PRESETS[0].hint} or ${AI_PRESETS[1].hint}</span></div>
         <div class="field"><label>API base URL</label><input id="ai-base" value="${esc(ai.base || AI_PRESETS[0].base)}"></div>
         <div class="field"><label>Model (needs vision 👁️)</label><input id="ai-model" value="${esc(ai.model || AI_PRESETS[0].model)}"></div>
-        <div class="field full"><label>API key ${ai.configured ? `<span class="pos">✓ saved <b class="mono">${esc(ai.keyHint || '')}</b> — paste a new one to replace</span>` : ''}</label>
+        <div class="field full"><label>API key ${ai.configured
+          ? `<span class="pos">✓ saved <b class="mono">${esc(ai.keyHint || '')}</b>${ai.fromEnv ? ' · 🔒 <b>server env — deploy-proof</b>' : ' — paste a new one to replace'}</span>`
+          : ''}</label>
           <input id="ai-key" type="password" placeholder="sk-or-… / gsk_…" autocomplete="off"></div>
       </div>
       <div class="chips mt">
@@ -1200,11 +1202,13 @@ window.testAI = async () => {
 /* v4.6.2: one-tap truth about the screenshot lane. Sends a real image from the SERVER
    (key never leaves it), tells you which models actually accept vision on your key, and
    lets you apply the working one without typing. */
-window.diagnoseAI = async () => {
+window.diagnoseAI = async (probeAll) => {
   const out = $('#aiTestOut');
-  out.innerHTML = '🔬 Probing your key with a real image… (up to ~30s) ⏳';
+  out.innerHTML = probeAll
+    ? '🔬 Testing every model for the most accurate reading… (up to ~90s) ⏳'
+    : '🔬 Probing your key with a real image… (up to ~30s) ⏳';
   try {
-    const r = await api('/api/ai-probe');
+    const r = await api('/api/ai-probe' + (probeAll ? '?all=1' : ''));
     const rows = r.results.map(x => `
       <div class="probe-row ${x.ok ? 'ok' : 'bad'}">
         <div class="pr-top"><b class="mono">${esc(x.model)}</b>
@@ -1215,6 +1219,8 @@ window.diagnoseAI = async () => {
       </div>`).join('');
     out.innerHTML = `<b>🔬 Vision diagnostic</b><br><span style="color:var(--muted);font-size:12px">${esc(r.provider)}</span>
       ${rows}
+      ${!probeAll ? `<button class="btn" style="margin-top:10px" onclick="diagnoseAI(true)">🔬 Test every model — find the most accurate</button>
+        <div class="pr-sub" style="margin-top:4px">Bigger models read small price digits far better. Worth 90 seconds if numbers come out wrong.</div>` : ''}
       ${r.winner ? '' : `<div class="pr-sub" style="margin-top:8px">No vision model answered. If every row says <b>429</b>, your free quota is drained — wait a bit, or use 📄 statement import (no AI needed) to keep logging trades now.</div>`}`;
   } catch (e) { out.innerHTML = `<span class="neg">✗ ${esc(e.message)}</span>`; }
 };
@@ -1463,7 +1469,7 @@ function renderAutofill() {
   </div>`;
   wireAutofill();
 }
-window.afMethod = m => { S.af.method = m; S.af.drafts = null; S.af.status = ''; renderAutofill(); };
+window.afMethod = m => { S.af.method = m; S.af.drafts = null; S.af.status = ''; S.af.transcript = ''; renderAutofill(); };
 window.afBack = () => {
   if (S.af.drafts !== null) { S.af.drafts = null; renderAutofill(); }
   else if (S.af.method) { S.af.method = null; renderAutofill(); }
@@ -1558,6 +1564,9 @@ function afDraftsBody() {
         <span class="mono ${cls(d.pnl)}" style="font-weight:800">${d.pnl != null ? money(d.pnl) : '~' + money(d.pnlEstimated)}</span>
         ${d.dup ? '' : `<button class="btn btn-ghost" style="padding:6px 12px" onclick="afReview(${i})">✏️</button>`}
       </div>`).join('')}
+    ${af.transcript ? `<details class="af-ocr" style="margin-top:14px"><summary>🔍 What the AI actually read — check it before importing</summary>
+      <pre class="af-ocr-pre">${esc(af.transcript)}</pre>
+      <div style="font-size:11px;color:var(--muted);margin-top:6px">If these numbers differ from your screenshot, ✏️ edit the trade below — or crop the shot tighter and re-run.</div></details>` : ''}
     <button class="btn btn-primary btn-lg btn-block mt" onclick="afImportAll()">⚡ Import all ${af.drafts.filter(d => !d.dup).length} new trades</button>
   `;
 }
@@ -1574,11 +1583,11 @@ function wireAutofill() {
         if (files.length > room) toast(`📸 Max ${AF_MAX_SHOTS} screenshots per batch — extra ${files.length - room} skipped`);
         for (const f of files.slice(0, room)) {
           try {
-            // v4.6.2: AI reads price levels, not pixels — 1280px @ 0.75 keeps every number
-            // legible while cutting ~40% of the payload. On a metered free tier that's the
-            // difference between a request that lands and one that gets bounced.
-            const data = await compressImage(f, 1280, 0.75);
-            af.images.push({ data, ext: '.jpg', preview: 'data:image/jpeg;base64,' + data });
+            // v4.6.4 ACCURACY FIRST: JPEG artefacts smear small price digits and the model
+            // misreads them (that's the "wrong numbers" bug). PNG is lossless, so 6350.20
+            // can't morph into 6350.26. Bigger payload, trustworthy numbers — worth it.
+            const data = await compressImage(f, 1800, 0.95, 'image/png');
+            af.images.push({ data, ext: '.png', preview: (data.startsWith('data:') ? '' : 'data:image/png;base64,') + data });
           } catch (err) { toast('⚠️ Couldn\'t read an image'); }
         }
         e.target.value = '';
@@ -1688,6 +1697,7 @@ async function runAIParse({ images = [], text = '' }) {
           : 'Extracting trades… this takes a few seconds ⏳';
         const res = await api('/api/ai-parse', 'POST', { images: rounds[r], hint });
         if (res.via) af.via = res.via;
+        if (res.transcript) af.transcript = (af.transcript ? af.transcript + '\n\n' : '') + res.transcript;
         for (const d of (res.trades || [])) {
           if (!tradesRaw.some(x => rawTradeSame(x, d))) tradesRaw.push(d); // same trade on 2 screenshots = one draft
         }
@@ -1695,6 +1705,7 @@ async function runAIParse({ images = [], text = '' }) {
     } else {
       const res = await api('/api/ai-parse', 'POST', { images: [], text, hint });
       if (res.via) af.via = res.via;
+      if (res.transcript) af.transcript = res.transcript;
       tradesRaw = res.trades || [];
     }
     const raw = tradesRaw.map(d => {
@@ -2006,7 +2017,7 @@ function renderShotRows() {
 }
 window.shotsTmp = shotsTmp;
 
-function compressImage(file, maxDim = 1600, quality = 0.82) {
+function compressImage(file, maxDim = 1600, quality = 0.82, mime = 'image/jpeg') {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => {
@@ -2017,7 +2028,8 @@ function compressImage(file, maxDim = 1600, quality = 0.82) {
         cv.width = Math.round(img.width * scale);
         cv.height = Math.round(img.height * scale);
         cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
-        resolve(cv.toDataURL('image/jpeg', quality).split(',')[1]);
+        // PNG ignores `quality` — it's always lossless, which is the point for screenshots
+        resolve(cv.toDataURL(mime, quality).split(',')[1]);
       };
       img.onerror = reject;
       img.src = reader.result;

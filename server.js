@@ -34,6 +34,21 @@ function aiCfg() {
   };
 }
 const keyHint = k => (k && k.length > 10) ? (k.slice(0, 6) + '\u2026' + k.slice(-4)) : (k ? '[short key!]' : '[none]');
+/* One chat call with a single polite retry when the free tier bounces us (429/503). */
+async function chatOnce(cfg, parts, maxTokens = 2000, timeoutMs = 60000) {
+  const call = () => fetch(cfg.base + '/chat/completions', {
+    method: 'POST',
+    headers: aiHeaders(cfg),
+    body: JSON.stringify({ model: cfg.model, messages: [{ role: 'user', content: parts }], temperature: 0, max_tokens: maxTokens }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  let r = await call();
+  if (r.status === 429 || r.status === 503) { await new Promise(s => setTimeout(s, 12000)); r = await call(); }
+  const txt = await r.text();
+  let j = null; try { j = JSON.parse(txt); } catch { throw new Error('non-JSON reply (HTTP ' + r.status + ')'); }
+  if (!r.ok) throw new Error((j && j.message) || 'HTTP ' + r.status);
+  return (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) || '';
+}
 function aiHeaders(cfg) {
   const h = {
     'Authorization': 'Bearer ' + cfg.key,
@@ -45,13 +60,31 @@ function aiHeaders(cfg) {
   if (/googleapis\.com/.test(cfg.base)) h['x-goog-api-key'] = cfg.key;
   return h;
 }
-const maskAI = ai => ({
-  base: ai?.base || 'https://openrouter.ai/api/v1',
-  model: ai?.model || 'google/gemma-4-31b-it:free',
-  key: '',
-  keyHint: keyHint(process.env.AI_KEY || ai?.key || ''),
-  configured: !!(process.env.AI_KEY || ai?.key),
-});
+// v4.6.3: report the EFFECTIVE config (env wins over stored), and flag when the key comes
+// from a server env var — that's the deploy-proof lane, so Mo can see at a glance that
+// redeploying can't wipe it again.
+const maskAI = () => {
+  const c = aiCfg();
+  return {
+    base: c.base, model: c.model, key: '',
+    keyHint: keyHint(c.key),
+    configured: !!c.key,
+    fromEnv: !!process.env.AI_KEY,
+  };
+};
+/* v4.6.4 ACCURACY: small vision models (12B) misread digits when asked to read a chart AND
+   reason about it in one step. So we split it: (1) pure OCR — transcribe the screenshot
+   verbatim, digit for digit; (2) extract structured trades from that clean text. Reading
+   then reasoning is dramatically more faithful than doing both at once. */
+const AI_OCR_PROMPT = `You are a precise OCR engine for trading screenshots. Transcribe EVERY line of visible text exactly as it appears, digit for digit.
+Rules:
+- Preserve row order and column order. Output one line per row.
+- Keep every decimal point exactly where it is. Do NOT round, convert, reformat or "clean" numbers.
+- Do not summarise, skip rows, merge rows, or add commentary.
+- Do not invent or guess any value. If a character is uncertain, write your best reading followed by ?.
+- Include headers, times, symbols, prices, volumes, profit/loss figures and any on-chart labels.
+Output plain text only — no markdown, no explanation.`;
+
 const AI_EXTRACT_PROMPT = `You are the extraction engine of a trading journal. Read the broker screenshot(s)/history and return ONLY a JSON object (no markdown, no prose):
 {"trades":[{"pair":"Volatility 75","dir":"long","lots":1,"entry":6350.2,"exit":6358.7,"sl":6345.2,"tp":6360.2,"openTime":"2026-09-19 09:14","closeTime":"2026-09-19 15:40","pnl":8.5,"setup":"Break & retest","broker":"Weltrade"}]}
 Rules: dir must be "long" (buy) or "short" (sell). Use 24h times, numbers without currency symbols, null for anything not visible. If the image shows a history/statement, extract EVERY trade row. If the image is a chart with an open/closed position, extract what's shown (prices, symbol, size). "setup" = strategy name only if annotated on the chart, else null. Return {"trades":[]} if nothing trade-like is visible.
@@ -195,6 +228,8 @@ async function gistBoot() {
       const content = full.files[GIST_FILE] && full.files[GIST_FILE].content;
       if (content && content.length > 10) {
         const incoming = migrate(JSON.parse(content));
+        // remember what the vault holds, so we can refuse to overwrite it with emptiness
+        gist.remoteTrades = (incoming.trades || []).length;
         // v4.6.0 VAULT TIME-LOCK: refuse a roll-back. If the local seal is NEWER than the
         // incoming vault copy (stale gist after a Render nap), keep the newer AI key.
         const inSeal = incoming?.meta?.aiSealedAt || 0;
@@ -235,6 +270,15 @@ async function pushGistNow() {
         if (!gist.enabled) { console.log('☁️  vault still unreachable — holding data locally, will retry.'); return; }
         scheduleSave(); // state may have been restored — persist it locally too
       }
+      // v4.6.3 WIPE GUARD: a fresh deploy boots with an empty local state. If the gist link
+      // blinked at that moment, the old code would push that emptiness straight over a
+      // populated vault — that is exactly how the journal went to 0 trades. Never again:
+      // refuse to write an EMPTY journal over a vault that demonstrably has trades.
+      if (gist.remoteTrades > 0 && (state.trades || []).length === 0 && !state.__allowWipe) {
+        console.log(`🛡️  WIPE GUARD: refusing to overwrite vault (${gist.remoteTrades} trades) with an empty journal — holding local.`);
+        return;
+      }
+      if (state.__allowWipe) delete state.__allowWipe;
       const files = { [GIST_FILE]: { content: JSON.stringify(state) } };
       // sweep new screenshots into the vault ride-along (max ~25MB per sweep)
       const swept = [];
@@ -268,6 +312,7 @@ async function pushGistNow() {
         swept.forEach(n => vaulted.add(n));
         state.meta.vaultedShots = [...vaulted];
         console.log(`🖼️  Pixel Vault: ${swept.length} screenshot(s) backed up to gist (${Math.round(bytes / 1024)}KB)`);
+        gist.remoteTrades = (state.trades || []).length; // vault now matches local
         // persist the manifest immediately so a crash can't double-upload
         try { fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(state, null, 2)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); } catch {}
       }
@@ -320,7 +365,7 @@ const server = http.createServer(async (req, res) => {
 
     if (p === '/api/state' && req.method === 'GET') {
       // never hand the client the AI key, just whether one exists
-      const pub = { ...state, settings: { ...state.settings, ai: maskAI(state.settings.ai) } };
+      const pub = { ...state, settings: { ...state.settings, ai: maskAI() } };
       return send(res, 200, pub);
     }
     if (p === '/api/meta' && req.method === 'GET') {
@@ -405,7 +450,7 @@ const server = http.createServer(async (req, res) => {
       scheduleSave();
       // flush the vault NOW: a freshly minted key must survive a Render sleep, not wait 8s.
       if (s.ai && s.ai.key && GIST_TOKEN) pushGistNow().catch(() => {});
-      return send(res, 200, { ok: true, settings: { ...state.settings, ai: maskAI(state.settings.ai) } });
+      return send(res, 200, { ok: true, settings: { ...state.settings, ai: maskAI() } });
     }
 
     // ---- AI AUTO-FILL ----
@@ -425,6 +470,9 @@ const server = http.createServer(async (req, res) => {
         .forEach(m => { if (!candidates.includes(m)) candidates.push(m); });
       const results = [];
       const t0 = Date.now();
+      // ?all=1 tests every candidate instead of stopping at the first success — bigger
+      // models read small price digits far more accurately, so let the trader choose.
+      const probeAll = /[?&]all=1/.test(req.url || '');
       for (const model of candidates.slice(0, 6)) {
         if (Date.now() - t0 > 75000) break; // never hang the phone
         const started = Date.now();
@@ -456,7 +504,7 @@ const server = http.createServer(async (req, res) => {
             rlTokensLeft: h('ratelimit-remaining-tokens') || h('x-ratelimit-remaining-tokens') || '',
             rlReset: h('ratelimit-reset-requests') || h('x-ratelimit-reset-requests') || h('retry-after') || '',
           });
-          if (r.ok) break; // found a working vision model — stop burning quota
+          if (r.ok && !probeAll) break; // found a working vision model — stop burning quota
         } catch (e) {
           results.push({ model, status: 0, ok: false, ms: Date.now() - started, error: e.name === 'TimeoutError' ? 'timed out' : e.message });
         }
@@ -510,11 +558,35 @@ const server = http.createServer(async (req, res) => {
       if (!cfg.key) return send(res, 400, { ok: false, error: 'NO_KEY', message: 'Add a free AI key first — Settings → 🪄 AI AUTO-FILL.' });
       let body;
       try { body = await readBody(req); } catch (e) { return send(res, 400, { ok: false, error: 'BAD_BODY' }); }
-      const content = [{ type: 'text', text: AI_EXTRACT_PROMPT + (body.hint ? '\nContext from the trader: ' + String(body.hint).slice(0, 500) : '') }];
+      const shotParts = [];
       (body.images || []).slice(0, 8).forEach(im => {
         const b64 = String(im.data || '').replace(/^data:image\/\w+;base64,/, '');
-        if (b64.length > 100) content.push({ type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + b64 } });
+        const mime = /\.png$/i.test(String(im.ext || '')) ? 'image/png' : 'image/jpeg';
+        if (b64.length > 100) shotParts.push({ type: 'image_url', image_url: { url: `data:${mime};base64,` + b64 } });
       });
+
+      // ---- v4.6.4 PASS 1: transcribe the screenshots verbatim (OCR) ----
+      let transcript = '';
+      if (shotParts.length) {
+        try {
+          const ocr = await chatOnce(cfg, [{ type: 'text', text: AI_OCR_PROMPT }, ...shotParts], 2500, 60000);
+          if (ocr && ocr.trim().length >= 8) {
+            transcript = ocr.trim();
+            console.log(`🔍 OCR pass: ${transcript.length} chars transcribed from ${shotParts.length} image(s)`);
+          }
+        } catch (e) { console.log('🔍 OCR pass failed, falling back to single-pass:', e.message); }
+      }
+
+      const content = [{ type: 'text', text: AI_EXTRACT_PROMPT + (body.hint ? '\nContext from the trader: ' + String(body.hint).slice(0, 500) : '') }];
+      if (transcript) {
+        // reason over clean text instead of re-reading pixels — far fewer digit errors
+        content[0].text += `\n\n===== EXACT TEXT TRANSCRIBED FROM THE SCREENSHOT(S) =====\n${transcript.slice(0, 12000)}\n===== END TRANSCRIPTION =====\n`
+          + 'Extract strictly from the transcription above. Copy every number EXACTLY as written (digit for digit, same decimal places). '
+          + 'Do NOT round, convert, recalculate or "correct" any value. Use null for anything absent. '
+          + 'If the transcription contains no trade data, return {"trades":[]}. Do not invent trades.';
+      } else if (shotParts.length) {
+        content.push(...shotParts); // OCR unusable — let the model look at the images directly
+      }
       if (body.text) content[0].text += '\n\nPasted history/text to extract from:\n' + String(body.text).slice(0, 12000);
       // lane-hopping: free-model pools congest (429) and retire (404) — rotate until one answers.
       const laneHop = /openrouter\.ai|localhost|127\.0\.0\.1/.test(cfg.base);
@@ -556,7 +628,7 @@ const server = http.createServer(async (req, res) => {
             let parsed;
             try { parsed = m ? JSON.parse(m[0]) : { trades: [] }; }
             catch (e) { return send(res, 400, { ok: false, error: 'AI_FAIL', message: 'AI returned unreadable JSON — try again or a cleaner screenshot.' }); }
-            return send(res, 200, { ok: true, via: model, trades: Array.isArray(parsed.trades) ? parsed.trades : [] });
+            return send(res, 200, { ok: true, via: model, transcript: transcript || '', trades: Array.isArray(parsed.trades) ? parsed.trades : [] });
           }
           const t = await r.text();
           lastErr = `AI error ${r.status}: ${t.slice(0, 250)}`;
@@ -626,6 +698,9 @@ const server = http.createServer(async (req, res) => {
       if (Array.isArray(body.trades)) state.trades = body.trades;
       if (Array.isArray(body.profiles)) state.profiles = body.profiles;
       if (body.settings && typeof body.settings === 'object') state.settings = body.settings;
+      // force = a deliberate, double-confirmed wipe — let it past the vault wipe-guard,
+      // otherwise the trades would resurrect from the vault on the next deploy.
+      if (body.force === true) state.__allowWipe = true;
       migrate(state);
       scheduleSave();
       return send(res, 200, { ok: true, trades: state.trades.length });

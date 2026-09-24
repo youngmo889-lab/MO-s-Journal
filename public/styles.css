@@ -452,3 +452,11 @@ input, select, textarea { font: inherit; }
 .emoji-grid { display: flex; flex-wrap: wrap; gap: 8px; }
 .emoji-grid button { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; font-size: 20px; padding: 8px 10px; }
 .emoji-grid button.on { border-color: var(--lime); background: var(--lime-dim); }
+
+/* v4.6.4 OCR verification panel */
+.af-ocr summary { cursor: pointer; font-size: 12px; font-weight: 700; color: var(--gold); padding: 6px 0; }
+.af-ocr-pre {
+  max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  font-size: 11px; line-height: 1.45; padding: 10px; margin-top: 6px;
+  background: rgba(0,0,0,.35); border: 1px solid var(--border); border-radius: 8px;
+}
