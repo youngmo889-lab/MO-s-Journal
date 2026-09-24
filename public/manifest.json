@@ -1,0 +1,13 @@
+{
+  "name": "Mo's Journal — Trading Journal",
+  "short_name": "Mo's Journal",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#0b0e14",
+  "theme_color": "#0b0e14",
+  "orientation": "portrait",
+  "description": "Synthetic-indices trading journal with AUTO-FILL, analytics and psychology tracking.",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

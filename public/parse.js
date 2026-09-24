@@ -125,36 +125,58 @@
   }
 
   /* -------- MT4 / MT5 HTML statements (browser only — needs DOMParser) -------- */
+  // v4.6.0: table rows without a DOM (regex fallback) — keeps parsing alive even where
+  // DOMParser is missing, and lets the same code be unit-tested outside the browser.
+  function htmlRows(text) {
+    if (typeof DOMParser !== 'undefined') {
+      const doc = new DOMParser().parseFromString(text, 'text/html');
+      return [...doc.querySelectorAll('tr')].map(tr =>
+        [...tr.querySelectorAll('th,td')].map(c => c.textContent.replace(/\s+/g, ' ').trim()));
+    }
+    const rows = [];
+    const trs = text.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+    for (const tr of trs) {
+      const cells = (tr.match(/<t[dh][\s\S]*?<\/t[dh]>/gi) || []).map(c =>
+        c.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim());
+      if (cells.length) rows.push(cells);
+    }
+    return rows;
+  }
+
   function parseHTML(text) {
-    if (typeof DOMParser === 'undefined') return [];
-    const doc = new DOMParser().parseFromString(text, 'text/html');
-    const rows = [...doc.querySelectorAll('tr')].map(tr =>
-      [...tr.querySelectorAll('th,td')].map(c => c.textContent.replace(/\s+/g, ' ').trim()));
+    const rows = htmlRows(text);
+    if (!rows.length) return [];
     const drafts = [];
     let map = null; // current header index map
     for (const cells of rows) {
       if (!cells.length) continue;
-      const low = cells.map(c => c.toLowerCase());
-      // header row? (MT5: Time, Position, Symbol, Type, Volume, Price, S / L, T / P, Time, Price, ..., Profit)
-      if (low.includes('symbol') && (low.includes('profit') || low.includes('volume'))) {
+      const low = cells.map(c => c.toLowerCase().replace(/\s+/g, ' ').trim());
+      // v4.6.0 ALIAS HEADER MAP: brokers disagree on words. MT5 says "Symbol/Volume",
+      // MT4 & Weltrade say "Item/Size", Deriv says "Contract". Accept them all — a missed
+      // alias used to silently map lots←ticket and entry←"2026.09". Never trust exact words.
+      const has = re => low.findIndex(h => re.test(h));
+      const isHeader = has(/^(symbol|item|instrument|contract|asset)$/) >= 0
+        && (has(/^(profit|pnl|pl)$/) >= 0 || has(/^(volume|size|lots|amount)$/) >= 0);
+      if (isHeader) {
         map = {};
         const times = [], prices = [];
         low.forEach((h, i) => {
-          if (h === 'time') times.push(i);
-          if (h === 'price') prices.push(i);
-          if (h === 'symbol') map.pair = i;
-          if (h === 'type') map.dir = i;
-          if (h === 'volume') map.lots = i;
-          if (/^s ?\/ ?l/.test(h)) map.sl = i;
-          if (/^t ?\/ ?p/.test(h)) map.tp = i;
-          if (h === 'profit') map.pnl = i;
+          if (/^(open time|close time|time|opened|closed|date)$/.test(h)) times.push(i);
+          if (/^(price|open price|close price|entry|exit)$/.test(h)) prices.push(i);
         });
+        // positional times/prices: open comes first, close second (MT5 prints two of each)
+        map.pair = has(/^(symbol|item|instrument|contract|asset)$/);
+        map.dir  = has(/^(type|direction|side|action)$/);
+        map.lots = has(/^(volume|size|lots|amount|units)$/);
+        map.sl   = has(/^s ?\/ ?l$|^(stop loss|sl)$/);
+        map.tp   = has(/^t ?\/ ?p$|^(take profit|tp)$/);
+        map.pnl  = has(/^(profit|pnl|pl|net profit)$/);
         map.date = times[0]; map.closedAt = times[1];
         map.entry = prices[0]; map.exit = prices[1];
         continue;
       }
-      // MT5 data row (has mapped header)
-      if (map && cells.length >= 8 && /buy|sell/i.test(cells[map.dir] || '')) {
+      // MT5/MT4 data row (has mapped header)
+      if (map && map.dir >= 0 && cells.length >= 6 && /buy|sell|long|short/i.test(cells[map.dir] || '')) {
         const d = normalize({
           pair: cells[map.pair], dir: cells[map.dir], lots: cells[map.lots],
           entry: cells[map.entry], exit: cells[map.exit],
@@ -186,12 +208,27 @@
       if (!l || l.length < 8) return;
       const dir = /(\bbuy\b|\blong\b)/i.test(l) ? 'long' : /(\bsell\b|\bshort\b)/i.test(l) ? 'short' : null;
       if (!dir) return;
-      const symMatch = l.match(/((Volatility|Boom|Crash|Step|Jump|Range|DEX|Multi|Drift)[\w ()]*|[A-Z]{6}|[A-Z]{3}\/[A-Z]{3}|XAUUSD|US30|NAS100)/i);
-      const nums = (l.replace(/[,]/g, '.').match(/\d+\.?\d*/g) || []).map(Number).filter(Number.isFinite);
-      if (!symMatch || nums.length < 2) return;
+      // v4.6.0: the old pattern swallowed "Volatility 75 buy 1" as the SYMBOL and then read
+      // lots=75. Now: name + its own index number only ("Volatility 75"), and every number is
+      // read AFTER the symbol so the symbol's digits can't poison the price list.
+      const symMatch = l.match(/((?:Volatility|Boom|Crash|Step|Jump|Range|DEX|Multi|Drift|Hybrid)\s*\d{0,4}|[A-Z]{3}\/[A-Z]{3}|XAUUSD|XAGUSD|US30|NAS100|US500|GER40)/i);
+      if (!symMatch) return;
+      // numbers strictly after the symbol + direction words
+      const tail = l.slice(Math.max(symMatch.index + symMatch[0].length, (l.search(/\b(buy|sell|long|short)\b/i) || 0)));
+      // an explicit "profit/PnL 8.50" is the P&L — pull it out so it isn't mistaken for a price
+      let pnl = null;
+      const pnlM = tail.match(/(?:profit|pnl|p\/?l)\s*[:=]?\s*(-?\d[\d.,]*)/i);
+      if (pnlM) pnl = parseFloat(pnlM[1].replace(/,/g, '.').replace(/\.(?=\d{3}\b)/g, ''));
+      const nums = (tail.replace(pnlM ? pnlM[0] : '', ' ').match(/-?\d[\d.,]*/g) || [])
+        .map(s => parseFloat(s.replace(/,/g, '.'))).filter(Number.isFinite);
+      if (nums.length < 2) return;
+      const prices = nums.filter(n => Math.abs(n) > 5); // lot sizes are small; prices aren't
+      const lotsGuess = nums.find(n => n > 0 && n < 100 && !prices.includes(n));
       const d = normalize({
-        pair: symMatch[1], dir, lots: nums.length >= 3 ? nums[0] : 1,
-        entry: nums.length >= 3 ? nums[1] : nums[0], exit: nums[nums.length - 1],
+        pair: symMatch[1], dir,
+        lots: lotsGuess ?? (nums.length >= 3 ? nums[0] : 1),
+        entry: prices[0], exit: prices[1],
+        pnl: pnl != null ? pnl : null,
       });
       if (d) drafts.push(d);
     });
@@ -205,9 +242,17 @@
       const r = parseHTML(text);
       if (r.length) return r;
     }
-    const csv = parseCSV(text);
-    if (csv.length) return csv;
-    return parseLoose(text);
+    // v4.6.0: only trust the CSV lane if the text is genuinely delimited. Otherwise a pasted
+    // line like "Volatility 75 buy 1.0 6350.20 -> 6358.70" got shredded into lots=75, entry=1.
+    const lines = text.split(/\r?\n/).filter(l => l.trim()).slice(0, 50);
+    const delimited = lines.filter(l => /[,;\t]/.test(l)).length >= Math.max(1, Math.ceil(lines.length * 0.6));
+    if (delimited) {
+      const csv = parseCSV(text);
+      if (csv.length) return csv;
+    }
+    const loose = parseLoose(text);
+    if (loose.length) return loose;
+    return delimited ? [] : (parseCSV(text) || []);
   }
 
   const _root = typeof window !== 'undefined' ? window : {};

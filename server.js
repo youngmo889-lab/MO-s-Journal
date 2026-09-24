@@ -54,7 +54,9 @@ const maskAI = ai => ({
 });
 const AI_EXTRACT_PROMPT = `You are the extraction engine of a trading journal. Read the broker screenshot(s)/history and return ONLY a JSON object (no markdown, no prose):
 {"trades":[{"pair":"Volatility 75","dir":"long","lots":1,"entry":6350.2,"exit":6358.7,"sl":6345.2,"tp":6360.2,"openTime":"2026-09-19 09:14","closeTime":"2026-09-19 15:40","pnl":8.5,"setup":"Break & retest","broker":"Weltrade"}]}
-Rules: dir must be "long" (buy) or "short" (sell). Use 24h times, numbers without currency symbols, null for anything not visible. If the image shows a history/statement, extract EVERY trade row. If the image is a chart with an open/closed position, extract what's shown (prices, symbol, size). "setup" = strategy name only if annotated on the chart, else null. Return {"trades":[]} if nothing trade-like is visible.`;
+Rules: dir must be "long" (buy) or "short" (sell). Use 24h times, numbers without currency symbols, null for anything not visible. If the image shows a history/statement, extract EVERY trade row. If the image is a chart with an open/closed position, extract what's shown (prices, symbol, size). "setup" = strategy name only if annotated on the chart, else null. Return {"trades":[]} if nothing trade-like is visible.
+BACKTEST / CHART-ONLY SCREENSHOTS (very common): the trader screenshots a chart with horizontal lines or zones drawn for entry, stop-loss and take-profit, and possibly arrows or a shaded risk box. Read those drawn levels as entry/sl/tp. Also read any text labels on the chart (e.g. "sell", "entry 6350.2", "SL", "TP1", "BOS", "OB") and any profit/loss figure printed on screen.
+NEVER GUESS OR INVENT A NUMBER. Accuracy matters more than completeness — a wrong P&L corrupts the trader's statistics. If a price/level is not clearly visible, use null; do not infer it from other numbers. If the chart shows a planned or still-open trade with no visible exit, leave exit and pnl null. If lot size is not shown, use null (never assume 1). If no date is visible anywhere, leave openTime/closeTime null rather than using today's date.`;
 
 
 
@@ -191,7 +193,21 @@ async function gistBoot() {
       gist.id = found.id;
       const full = await gh('https://api.github.com/gists/' + found.id);
       const content = full.files[GIST_FILE] && full.files[GIST_FILE].content;
-      if (content && content.length > 10) state = migrate(JSON.parse(content));
+      if (content && content.length > 10) {
+        const incoming = migrate(JSON.parse(content));
+        // v4.6.0 VAULT TIME-LOCK: refuse a roll-back. If the local seal is NEWER than the
+        // incoming vault copy (stale gist after a Render nap), keep the newer AI key.
+        const inSeal = incoming?.meta?.aiSealedAt || 0;
+        const mySeal = state?.meta?.aiSealedAt || 0;
+        const inKey = incoming?.settings?.ai?.key || '';
+        const myKey = state?.settings?.ai?.key || '';
+        if (mySeal > inSeal && myKey && inKey && myKey !== inKey) {
+          console.log(`🛡️  vault roll-back REFUSED — keeping newer AI key (${keyHint(myKey)}, sealed ${new Date(mySeal).toISOString()})`);
+          incoming.settings.ai.key = myKey;
+          incoming.meta.aiSealedAt = mySeal;
+        }
+        state = incoming;
+      }
       decodeVaultShots(full.files);
       gist.restored = true;
       console.log('☁️  Gist sync: ON (existing backup found)');
@@ -204,11 +220,10 @@ async function gistBoot() {
   }
 }
 let gistTimer = null;
-function scheduleGistSave() {
-  if (!GIST_TOKEN) return;
-  clearTimeout(gistTimer);
-  gistTimer = setTimeout(async () => {
-    try {
+// v4.6.0: extracted so /api/settings can flush the vault INSTANTLY on key save —
+// no 8s window where a Render nap can orphan a freshly minted key.
+async function pushGistNow() {
+  try {
       if (!gist.enabled) {
         // NEVER CLOBBER THE VAULT: if the boot handshake blinked (Render cold-start),
         // re-arm the link first — and only push once the vault is proven reachable.
@@ -256,8 +271,12 @@ function scheduleGistSave() {
         // persist the manifest immediately so a crash can't double-upload
         try { fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(state, null, 2)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); } catch {}
       }
-    } catch (e) { console.log('gist save failed:', e.message); }
-  }, 8000);
+  } catch (e) { console.log('gist save failed:', e.message); }
+}
+function scheduleGistSave() {
+  if (!GIST_TOKEN) return;
+  clearTimeout(gistTimer);
+  gistTimer = setTimeout(pushGistNow, 8000);
 }
 
 /* ---------------- helpers ---------------- */
@@ -379,11 +398,73 @@ const server = http.createServer(async (req, res) => {
         if (!s.ai.key || s.ai.key.includes('•')) s.ai.key = keep.key || '';
       }
       state.settings = { ...state.settings, ...s };
+      // v4.6.0 VAULT TIME-LOCK: every seal is stamped. Anything that later tries to restore an
+      // OLDER seal is a roll-back (Render nap + stale vault = Mo's night of the sk-or-…8213
+      // corpse) and is REFUSED. Keys only ever move forward in time.
+      if (s.ai && s.ai.key && state.meta) state.meta.aiSealedAt = Date.now();
       scheduleSave();
+      // flush the vault NOW: a freshly minted key must survive a Render sleep, not wait 8s.
+      if (s.ai && s.ai.key && GIST_TOKEN) pushGistNow().catch(() => {});
       return send(res, 200, { ok: true, settings: { ...state.settings, ai: maskAI(state.settings.ai) } });
     }
 
     // ---- AI AUTO-FILL ----
+    /* v4.6.2 AI DIAGNOSTIC: runs where the key lives (server-side) so the key is never
+       exposed. Sends a real image and asks the model to look at it, then reports which
+       models on THIS key actually accept vision — plus the provider's own rate-limit
+       headers, which tell us whether a 429 is "wait 3s" or "you're capped for an hour". */
+    if (p === '/api/ai-probe' && req.method === 'GET') {
+      const cfg = aiCfg();
+      if (!cfg.key) return send(res, 400, { ok: false, error: 'NO_KEY', message: 'No key saved yet.' });
+      // 64x64 test image (black/white halves) — valid PNG, tiny, enough to prove vision works
+      const TEST_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAATklEQVR4nO3PMQEAAAgDoMWxfyhzGMFrHzQgWzZlERAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBD4HCxrUXjajQE6AAAAAElFTkSuQmCC';
+      const isMistral = /mistral\.ai/.test(cfg.base);
+      // candidate vision models for this provider, configured one first
+      const candidates = [cfg.model];
+      if (isMistral) ['pixtral-12b-2409', 'mistral-small-3.1-24b-instruct', 'pixtral-large-latest', 'mistral-large-latest', 'open-mistral-nemo', 'ministral-8b-latest']
+        .forEach(m => { if (!candidates.includes(m)) candidates.push(m); });
+      const results = [];
+      const t0 = Date.now();
+      for (const model of candidates.slice(0, 6)) {
+        if (Date.now() - t0 > 75000) break; // never hang the phone
+        const started = Date.now();
+        try {
+          const r = await fetch(cfg.base + '/chat/completions', {
+            method: 'POST',
+            headers: aiHeaders(cfg),
+            body: JSON.stringify({
+              model,
+              messages: [{ role: 'user', content: [
+                { type: 'text', text: 'Reply with exactly: OK' },
+                { type: 'image_url', image_url: { url: 'data:image/png;base64,' + TEST_PNG } },
+              ] }],
+              max_tokens: 8, temperature: 0,
+            }),
+            signal: AbortSignal.timeout(25000),
+          });
+          const txt = await r.text();
+          let j = null; try { j = JSON.parse(txt); } catch {}
+          const h = n => r.headers.get(n) || '';
+          results.push({
+            model, status: r.status, ok: r.ok,
+            ms: Date.now() - started,
+            reply: j ? String(j.choices?.[0]?.message?.content || '').slice(0, 40) : '',
+            error: j?.message || (r.ok ? '' : txt.slice(0, 120)),
+            code: j?.code || '',
+            // provider's own budget — the difference between "wait 3s" and "capped for an hour"
+            rlRequestsLeft: h('ratelimit-remaining-requests') || h('x-ratelimit-remaining-requests') || '',
+            rlTokensLeft: h('ratelimit-remaining-tokens') || h('x-ratelimit-remaining-tokens') || '',
+            rlReset: h('ratelimit-reset-requests') || h('x-ratelimit-reset-requests') || h('retry-after') || '',
+          });
+          if (r.ok) break; // found a working vision model — stop burning quota
+        } catch (e) {
+          results.push({ model, status: 0, ok: false, ms: Date.now() - started, error: e.name === 'TimeoutError' ? 'timed out' : e.message });
+        }
+      }
+      const winner = results.find(r => r.ok);
+      return send(res, 200, { ok: !!winner, provider: cfg.base, winner: winner?.model || '', results });
+    }
+
     if (p === '/api/ai-test' && req.method === 'GET') {
       const cfg = aiCfg();
       if (!cfg.key) return send(res, 400, { ok: false, error: 'NO_KEY', message: 'No AI key configured yet.' });
@@ -400,10 +481,14 @@ const server = http.createServer(async (req, res) => {
             signal: AbortSignal.timeout(30000),
           });
         } else {
-          // OpenRouter /auth/key truly verifies; Groq/OpenAI /models enforce auth properly.
-          r = await fetch(cfg.base + (isOR ? '/auth/key' : '/models'), {
-            headers: { 'Authorization': 'Bearer ' + cfg.key },
-            signal: AbortSignal.timeout(20000),
+          // v4.6.0 TRUTHFUL TEST: /models can lie — a key that lists models may still be dead
+          // at chat (Google proved it: green Test, 401 Analyze, same key). Fire a tiny REAL
+          // completion; if the model answers, the pipe genuinely works end-to-end.
+          r = await fetch(cfg.base + '/chat/completions', {
+            method: 'POST',
+            headers: aiHeaders(cfg),
+            body: JSON.stringify({ model: cfg.model, messages: [{ role: 'user', content: 'Reply with exactly: OK' }], max_tokens: 8, temperature: 0 }),
+            signal: AbortSignal.timeout(45000),
           });
         }
         if (!r.ok) {
@@ -435,8 +520,18 @@ const server = http.createServer(async (req, res) => {
       const laneHop = /openrouter\.ai|localhost|127\.0\.0\.1/.test(cfg.base);
       const chain = [cfg.model, ...(laneHop ? FREE_VISION_FALLBACK : [])].filter((m, i, a) => m && a.indexOf(m) === i);
       let lastErr = '', tried = 0, authFail = false;
+      // v4.6.0: free tiers pace at ~1 req/sec. Instead of failing instantly on 429 and
+      // making Mo hand-time a cooldown, the SERVER waits and retries the same lane politely.
+      const RATE_PATIENCE = laneHop ? 1 : 3;          // retries per lane on 429/503
+      const RATE_SLEEP = [12000, 20000, 30000];       // escalating backoff: bouncer gets bored
+      // Bounded patience: Render's proxy can cut a request around 60s. If we wait longer than
+      // that, Mo gets a network error while the server is still politely waiting — useless.
+      // So the whole retry budget is capped and we hand back an honest "try again" message.
+      const T0 = Date.now(), WAIT_BUDGET = 58000;
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
       for (const model of chain) {
         tried++;
+        for (let attempt = 0; attempt <= RATE_PATIENCE; attempt++) {
         try {
           const r = await fetch(cfg.base + '/chat/completions', {
             method: 'POST',
@@ -445,7 +540,17 @@ const server = http.createServer(async (req, res) => {
             signal: AbortSignal.timeout(90000),
           });
           if (r.ok) {
-            const j = await r.json();
+            // v4.6.0: never trust the body to be JSON. A retired/dead service can answer
+            // HTTP 200 with plain text (GitHub Models' tombstone answered "OK") — that used
+            // to surface as the inscrutable "Unexpected token 'O' … is not valid JSON".
+            const text = await r.text();
+            let j;
+            try { j = JSON.parse(text); }
+            catch (e) {
+              const stub = text.trim().slice(0, 60).replace(/\s+/g, ' ');
+              return send(res, 400, { ok: false, error: 'AI_DEAD_ENDPOINT',
+                message: `⚰️ ${cfg.base} answered HTTP 200 but not JSON (got: "${stub}"). That endpoint is retired or misconfigured — no key can fix it. Switch provider in ⚙️ Settings → AI AUTO-FILL (Mistral preset is recommended).` });
+            }
             const raw = j.choices?.[0]?.message?.content || '';
             const m = raw.match(/\{[\s\S]*\}/);
             let parsed;
@@ -456,10 +561,25 @@ const server = http.createServer(async (req, res) => {
           const t = await r.text();
           lastErr = `AI error ${r.status}: ${t.slice(0, 250)}`;
           if (r.status === 401 || r.status === 402 || r.status === 403) { authFail = true; break; } // auth/billing — no lane helps
-          // 404 (model retired) / 429 (lane busy) / 5xx (flake) → next lane
+          // v4.6.0: 429/503 = the bouncer, not a broken key. Wait it out and retry same lane.
+          if ((r.status === 429 || r.status === 503) && attempt < RATE_PATIENCE) {
+            const wait = RATE_SLEEP[attempt];
+            if (Date.now() - T0 + wait > WAIT_BUDGET) {
+              lastErr = `AI error ${r.status}: rate-limited. I waited as long as the server safely can — press 🧠 Analyze once more and it should land.`;
+              break;
+            }
+            console.log(`⏳ rate-limited by ${model} — backing off ${wait / 1000}s (attempt ${attempt + 1}/${RATE_PATIENCE})`);
+            await sleep(wait);
+            continue;
+          }
+          // 404 (model retired) / exhausted 429 / 5xx (flake) → next lane
+          break;
         } catch (e) {
           lastErr = e.name === 'TimeoutError' ? 'AI took too long — try fewer/smaller images.' : e.message;
+          break;
         }
+        }
+        if (authFail) break;
       }
       return send(res, 400, {
         ok: false, error: authFail ? 'AI_AUTH' : 'AI_FAIL', lanesTried: tried,
@@ -557,6 +677,18 @@ const server = http.createServer(async (req, res) => {
     }, ms));
   }
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`📒 Mo's Journal v4 · SMART edition running on http://0.0.0.0:${PORT}${GIST_TOKEN ? ' · gist sync enabled' : ''}`);
+    console.log(`📒 Mo's Journal v4.6 · ONE-TIME-FIX edition running on http://0.0.0.0:${PORT}${GIST_TOKEN ? ' · gist sync enabled' : ''}`);
+    // v4.6.0 KEEP-AWAKE: Render's free tier sleeps after ~15 min idle — and waking up
+    // used to roll the vault back to a stale key. We ping ourselves every 10 min so the
+    // server is never the reason a flow dies. (Only when KEEP_AWAKE_URL is set, e.g. on Render.)
+    const wakeUrl = process.env.KEEP_AWAKE_URL || (process.env.RENDER_EXTERNAL_URL ? process.env.RENDER_EXTERNAL_URL + '/api/state' : '');
+    if (wakeUrl) {
+      setInterval(() => {
+        fetch(wakeUrl, { signal: AbortSignal.timeout(20000) })
+          .then(() => console.log('🔔 keep-awake ping ok'))
+          .catch(e => console.log('🔔 keep-awake ping missed:', e.message));
+      }, 10 * 60 * 1000);
+      console.log(`🔔 keep-awake armed → ${wakeUrl} every 10 min`);
+    }
   });
 })();

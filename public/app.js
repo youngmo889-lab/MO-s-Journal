@@ -69,6 +69,7 @@ const PROFILE_TYPES = ['Live', 'Demo', 'Prop Challenge', 'Funded'];
 const PROFILE_BROKERS = ['Weltrade', 'Deriv', 'Other'];
 
 const AI_PRESETS = [
+  { name: '⭐ Mistral · free vision', base: 'https://api.mistral.ai/v1', model: 'mistral-small-latest', hint: 'free key at console.mistral.ai → API Keys · phone verification needed · auto-waits the free-tier bouncer' },
   { name: 'OpenRouter · free vision', base: 'https://openrouter.ai/api/v1', model: 'google/gemma-4-31b-it:free', hint: 'free key at openrouter.ai/keys · auto-hops 6 free lanes if one is busy' },
   { name: 'Groq · paste only',       base: 'https://api.groq.com/openai/v1', model: 'openai/gpt-oss-120b', hint: 'free key at console.groq.com · paste/history text only (Groq dropped vision in 2026)' },
   { name: 'OpenAI',                 base: 'https://api.openai.com/v1', model: 'gpt-4o-mini', hint: 'paid · platform.openai.com' },
@@ -1121,6 +1122,7 @@ function renderSettings() {
       <div class="chips mt">
         <button class="btn btn-primary" onclick="saveAI()">💾 Save AI settings</button>
         <button class="btn" onclick="testAI()">🔌 Test connection</button>
+        <button class="btn btn-gold" onclick="diagnoseAI()">🔬 Diagnose vision</button>
       </div>
       <div class="af-status" id="aiTestOut"></div>
     </div>
@@ -1195,6 +1197,36 @@ window.testAI = async () => {
   try { const r = await api('/api/ai-test'); out.innerHTML = `<b>🔌 ${esc(r.message)}</b>`; }
   catch (e) { out.innerHTML = `<span class="neg">✗ ${esc(e.message)}</span>`; }
 };
+/* v4.6.2: one-tap truth about the screenshot lane. Sends a real image from the SERVER
+   (key never leaves it), tells you which models actually accept vision on your key, and
+   lets you apply the working one without typing. */
+window.diagnoseAI = async () => {
+  const out = $('#aiTestOut');
+  out.innerHTML = '🔬 Probing your key with a real image… (up to ~30s) ⏳';
+  try {
+    const r = await api('/api/ai-probe');
+    const rows = r.results.map(x => `
+      <div class="probe-row ${x.ok ? 'ok' : 'bad'}">
+        <div class="pr-top"><b class="mono">${esc(x.model)}</b>
+          <span>${x.ok ? `✅ vision works (${x.ms}ms)${x.reply ? ' · replied: ' + esc(x.reply.trim()) : ''}`
+                       : `❌ ${x.status || 'ERR'} ${esc(x.error || '')}`}</span></div>
+        ${x.rlRequestsLeft || x.rlReset ? `<div class="pr-sub">quota left: ${esc(x.rlRequestsLeft || '—')} requests · resets: ${esc(x.rlReset || '—')}</div>` : ''}
+        ${x.ok ? `<button class="btn btn-gold" style="padding:5px 10px;margin-top:6px" onclick="applyModel('${esc(x.model)}')">Use this model ✓</button>` : ''}
+      </div>`).join('');
+    out.innerHTML = `<b>🔬 Vision diagnostic</b><br><span style="color:var(--muted);font-size:12px">${esc(r.provider)}</span>
+      ${rows}
+      ${r.winner ? '' : `<div class="pr-sub" style="margin-top:8px">No vision model answered. If every row says <b>429</b>, your free quota is drained — wait a bit, or use 📄 statement import (no AI needed) to keep logging trades now.</div>`}`;
+  } catch (e) { out.innerHTML = `<span class="neg">✗ ${esc(e.message)}</span>`; }
+};
+window.applyModel = async m => {
+  const s = S.settings.ai || {};
+  await api('/api/settings', 'POST', { ai: { base: s.base, model: m } });
+  await loadState(); renderAll();
+  toast(`✅ Model set to ${m}`, 'gold');
+  const out = $('#aiTestOut'); if (out) out.innerHTML = `<b>✅ Now using <span class="mono">${esc(m)}</span></b><br>Go log those trades — 🪄 AUTO-FILL → 📸`;
+  go('settings');
+};
+
 window.removeRule = async i => { S.settings.rules.splice(i, 1); await api('/api/settings', 'POST', S.settings); renderAll(); };
 window.addRule = async () => {
   const v = $('#newRule').value.trim(); if (!v) return;
@@ -1397,13 +1429,13 @@ function renderAutofill() {
   let body = '';
   if (!af.method) {
     body = `<div class="method-grid">
-      <button class="choice-tile ${aiReady() ? 'gold' : ''}" onclick="afMethod('shots')">
-        <span class="ct-emoji">📸</span><span class="ct-title">Screenshots</span>
-        <span class="ct-desc">Broker history, open/closed positions, P&amp;L cards, annotated charts. ${aiReady() ? 'AI reads it all.' : '<b class="neg">Needs an AI key</b> — set one up in Settings → AI AUTO-FILL.'}</span>
+      <button class="choice-tile gold" onclick="afMethod('file')">
+        <span class="ct-emoji">📄</span><span class="ct-title">⚡ Statement file — most reliable</span>
+        <span class="ct-desc">MT4/MT5 report (.htm) or any CSV export — Weltrade MT5: <i>Toolbox → History → right-click → Report</i>. <b>No AI, no key, no rate limit, works offline.</b> Pick several at once.</span>
       </button>
-      <button class="choice-tile" onclick="afMethod('file')">
-        <span class="ct-emoji">📄</span><span class="ct-title">Statement file</span>
-        <span class="ct-desc">MT4/MT5 report (.htm) or any CSV export — Weltrade MT5: <i>Toolbox → History → right-click → Report</i>. <b>No AI needed, works offline.</b></span>
+      <button class="choice-tile ${aiReady() ? '' : ''}" onclick="afMethod('shots')">
+        <span class="ct-emoji">📸</span><span class="ct-title">Screenshots${aiReady() ? '' : ' · needs key'}</span>
+        <span class="ct-desc">Broker history, open/closed positions, P&amp;L cards, annotated charts. ${aiReady() ? 'AI reads it all (auto-waits rate limits).' : '<b class="neg">Needs an AI key</b> — set one up in Settings → AI AUTO-FILL.'}</span>
       </button>
       <button class="choice-tile" onclick="afMethod('paste')">
         <span class="ct-emoji">📋</span><span class="ct-title">Paste history</span>
@@ -1425,7 +1457,7 @@ function renderAutofill() {
           <button class="modal-close" onclick="closeModal()">✕</button>
         </div>
       </div>
-      <div style="font-size:12px;color:var(--muted);margin-bottom:12px">Importing into: <b>${prof ? prof.emoji + ' ' + esc(prof.name) : '—'}</b> · switch accounts from the top bar first if needed</div>
+      ${afTargetBar(defProfile)}
       ${body}
     </div>
   </div>`;
@@ -1438,6 +1470,28 @@ window.afBack = () => {
   else closeModal();
 };
 
+/* v4.6.1 BACKTEST TARGET: pick the destination account right here instead of
+   silently inheriting the top-bar view. Backtesting from Main Account used to
+   dump paper trades into live stats with no warning. */
+function afTargetId() {
+  const af = S.af;
+  return (af.target && profileById(af.target)?.id) || (S.view !== 'all' ? S.view : S.profiles[0]?.id);
+}
+function afTargetBar() {
+  const id = afTargetId();
+  const p = profileById(id);
+  const isPaper = p && (p.type === 'Demo' || /backtest|back test/i.test(p.name || ''));
+  if (!S.profiles.length) return '';
+  return `<div class="af-target">
+    <span>Landing in</span>
+    <select id="afTargetSel" onchange="afSetTarget(this.value)">
+      ${S.profiles.map(x => `<option value="${x.id}" ${x.id === id ? 'selected' : ''}>${x.emoji || '💼'} ${esc(x.name)} · ${esc(x.type || '')}</option>`).join('')}
+    </select>
+    ${isPaper ? '<span class="af-paper-tag">🧪 paper — won\'t touch live stats</span>' : ''}
+  </div>`;
+}
+window.afSetTarget = id => { S.af.target = id; renderAutofill(); };
+
 function afInputBody() {
   const af = S.af;
   if (af.method === 'shots') {
@@ -1448,6 +1502,9 @@ function afInputBody() {
       <div class="af-preview" id="afPreview"></div>
       <div class="field mt"><label>Context for the AI (optional)</label>
         <input id="afHint" placeholder="e.g. These are my Weltrade MT5 closed positions from this week"></div>
+      <div class="field mt"><label>🧪 Backtest date (optional)</label>
+        <input id="afDate" type="date" value="${esc(S.af.defaultDate || '')}" onchange="S.af.defaultDate=this.value">
+        <span class="hint">Backtesting an old chart? Set the day you're testing — trades the AI can't date itself land here instead of "today", so your history stays honest.</span></div>
       <button class="btn btn-primary btn-lg btn-block mt" id="afGo" disabled>🧠 Analyze with AI</button>
       <div class="af-status" id="afStatus"></div>
       <div style="font-size:11px;color:var(--muted);margin-top:10px">💡 History/statements import fastest with everything visible. Charts: make sure symbol, direction &amp; prices are readable.</div>`
@@ -1459,18 +1516,24 @@ function afInputBody() {
   if (af.method === 'file') {
     return `
       <div class="upload-drop" id="afDrop"><span class="big">📄</span>
-        <span>Tap to choose your MT4/MT5 report (.htm) or CSV export</span>
-        <input type="file" id="afInput" accept=".csv,.htm,.html,.txt" class="hidden"></div>
+        <span>Tap to add files — MT4/MT5 report (.htm), CSV export, .txt, or a journal backup. <b>Pick several at once.</b></span>
+        <input type="file" id="afInput" accept=".csv,.htm,.html,.txt,.json" multiple class="hidden"></div>
+      <div class="af-preview" id="afPreview"></div>
       <div class="af-status" id="afStatus"></div>
       <div style="font-size:12px;color:var(--muted);margin-top:12px">
         <b>Weltrade / Deriv MT5:</b> open MT5 → Toolbox → <b>History</b> tab → right-click → <b>Report → HTML</b> (or CSV) → feed it here.<br><br>
-        <b>No AI needed</b> — the parser reads times, prices, SL/TP &amp; profit straight from the file. Offline &amp; instant. ⚡
+        <b>No AI needed, no key, no rate limit.</b> The parser reads times, prices, SL/TP &amp; profit straight off the file — offline &amp; instant. ⚡
       </div>`;
   }
   return `
     <div class="field full"><label>Paste your history</label>
       <textarea id="afText" rows="8" placeholder="Paste trade history text here… e.g. lines like:\nVolatility 75 buy 1.0 6350.20 → 6358.70 profit 8.50\n\nOr dump whatever your broker shows — ${aiReady() ? 'AI will structure it.' : 'AI (with a key) can structure real mess.'}"></textarea></div>
-    <button class="btn btn-primary btn-lg btn-block mt" id="afGo">${aiReady() ? '🧠 Parse with AI' : '⚡ Quick-parse'}</button>
+    <div class="field full"><label>🧪 Backtest date (optional)</label>
+      <input id="afDate" type="date" value="${esc(S.af.defaultDate || '')}" onchange="S.af.defaultDate=this.value">
+      <span class="hint">Undated rows land on this day instead of today.</span></div>
+    <div class="chips mt"><button class="btn btn-primary" id="afGo">${aiReady() ? '🧠 Parse with AI' : '⚡ Quick-parse'}</button>
+      ${aiReady() ? '<button class="btn" id="afGoOffline">⚡ Offline (no AI)</button>' : ''}</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:8px">⚡ Offline never rate-limits. One trade per line, e.g. <span class="mono">Volatility 75 buy 1.0 6350.20 → 6358.70 profit 8.50</span></div>
     <div class="af-status" id="afStatus"></div>`;
 }
 
@@ -1511,7 +1574,10 @@ function wireAutofill() {
         if (files.length > room) toast(`📸 Max ${AF_MAX_SHOTS} screenshots per batch — extra ${files.length - room} skipped`);
         for (const f of files.slice(0, room)) {
           try {
-            const data = await compressImage(f);
+            // v4.6.2: AI reads price levels, not pixels — 1280px @ 0.75 keeps every number
+            // legible while cutting ~40% of the payload. On a metered free tier that's the
+            // difference between a request that lands and one that gets bounced.
+            const data = await compressImage(f, 1280, 0.75);
             af.images.push({ data, ext: '.jpg', preview: 'data:image/jpeg;base64,' + data });
           } catch (err) { toast('⚠️ Couldn\'t read an image'); }
         }
@@ -1519,18 +1585,41 @@ function wireAutofill() {
         renderAfPreview();
       };
     } else if (af.method === 'file') {
+      // v4.6.0: multi-file intake — CSV + HTML + txt all at once, merged into one draft set.
       input.onchange = async e => {
-        const f = e.target.files[0]; if (!f) return;
-        const text = await f.text();
+        const files = [...(e.target.files || [])];
+        e.target.value = '';
+        if (!files.length) return;
         const status = $('#afStatus');
-        status.innerHTML = 'Reading <b>' + esc(f.name) + '</b>… ⚙️';
-        const drafts = (window.MJParse ? MJParse.auto(text, f.name) : []).map(normalizeDraftForApp).filter(Boolean);
-        af.drafts = markDups(drafts);
-        af.status = drafts.length ? '' : `I read "${f.name}" but found no trade rows. If it's an MT5 HTML report, make sure it contains the Positions table.`;
+        let all = [], names = [], empties = [];
+        for (const f of files) {
+          status.innerHTML = `Reading <b>${esc(f.name)}</b>… ⚙️`;
+          let text = '';
+          try { text = await f.text(); } catch { empties.push(f.name); continue; }
+          let found = [];
+          try { found = (window.MJParse ? MJParse.auto(text, f.name) : []) || []; }
+          catch (pe) { console.warn('parse failed', f.name, pe); }
+          const norm = found.map(normalizeDraftForApp).filter(Boolean);
+          if (norm.length) { all = all.concat(norm); names.push(`${f.name} (${norm.length})`); }
+          else empties.push(f.name);
+        }
+        af.drafts = markDups(all);
+        af.status = all.length
+          ? `📄 ${names.join(' · ')} — merged.`
+          : `I read ${files.length} file${files.length > 1 ? 's' : ''} but found no trade rows. For MT5, use Toolbox → History → right-click → Report (HTML or CSV), and make sure the Positions table is in it.`;
         renderAutofill();
       };
     }
   }
+  const off = $('#afGoOffline');
+  if (off) off.onclick = () => {
+    const text = $('#afText').value.trim();
+    if (!text) return toast('⚠️ Paste something first');
+    const drafts = (window.MJParse ? MJParse.parseLoose(text) : []).map(normalizeDraftForApp).filter(Boolean);
+    af.drafts = markDups(drafts);
+    af.status = drafts.length ? '' : 'No trades recognised. Try one per line: Symbol buy/sell lots entry → exit profit';
+    renderAutofill();
+  };
   const go = $('#afGo');
   if (go) {
     go.onclick = async () => {
@@ -1581,9 +1670,13 @@ async function runAIParse({ images = [], text = '' }) {
   const status = $('#afStatus'), go = $('#afGo');
   af.busy = true;
   if (go) { go.disabled = true; go.textContent = '🧠 AI is reading…'; }
-  if (status) status.innerHTML = 'Extracting trades… this takes a few seconds ⏳';
+  // v4.6.0: the server now auto-waits the free-tier bouncer, so a slow reply is normal.
+  if (status) status.innerHTML = 'Extracting trades… ⏳ <span style="color:var(--muted)">(if the provider rate-limits us, I wait and retry automatically — up to ~90s. Don\'t press twice.)</span>';
   try {
     const hint = $('#afHint') ? $('#afHint').value.trim() : '';
+    // v4.6.1: remember the backtest date so undated chart trades land on the tested day.
+    const dt = $('#afDate') ? $('#afDate').value : '';
+    if (dt) S.af.defaultDate = dt;
     // multi-shot mode: free-tier vision caps ~5 images/request, so feed in rounds of 4 and merge
     let tradesRaw = [];
     if (images.length) {
@@ -1628,6 +1721,11 @@ async function runAIParse({ images = [], text = '' }) {
     af.busy = false;
     if (status) status.innerHTML = `<span class="neg">✗ ${esc(e.message)}</span>`;
     if (e.code === 'NO_KEY' && status) status.innerHTML += `<br><button class="btn btn-gold mt" onclick="closeModal();go('settings')">Set up AI key →</button>`;
+    // v4.6.0: never dead-end on AI trouble — the offline file lane always works.
+    if (e.code !== 'NO_KEY' && status) {
+      status.innerHTML += `<br><br><span style="color:var(--muted)">Don't want to fight the AI at all?</span><br>
+        <button class="btn btn-gold mt" onclick="afMethod('file')">📄 Import a statement file instead — no AI, no limits ⚡</button>`;
+    }
     if (go) { go.disabled = false; go.textContent = '🧠 Analyze with AI'; }
   }
 }
@@ -1641,7 +1739,13 @@ function normalizeDraftForApp(d) {
   });
   const finalPnl = d.pnl != null ? num(d.pnl) : n.pnlEstimated;
   if (d.entry == null && finalPnl == null) return null;
-  const date = d.date || new Date().toISOString();
+  // v4.6.1: backtest charts often show no date — use the tested day instead of "now",
+  // so a backtested setup lands on the day you were actually testing.
+  let date = d.date || new Date().toISOString();
+  if (!d.date && S.af && S.af.defaultDate) {
+    const noon = new Date(S.af.defaultDate + 'T12:00:00');
+    if (!isNaN(noon.getTime())) date = noon.toISOString();
+  }
   return {
     ...d, pair: canon, dir: d.dir === 'short' ? 'short' : 'long',
     lots: d.lots ?? 1, entry: num(d.entry), exit: num(d.exit), sl: num(d.sl), tp: num(d.tp),
@@ -1697,7 +1801,7 @@ window.afImportAll = async () => {
     const wn = `${g[0].pair} · ${new Date(g[0].date).toLocaleDateString('en-US', { day: 'numeric', month: 'short' })}`;
     g.forEach((d, i) => { d.wave = wn; d.waveRole = i === 0 ? 'initial' : 'add'; });
   });
-  const defProfile = S.view !== 'all' ? S.view : S.profiles[0].id;
+  const defProfile = afTargetId(); // v4.6.1: the account picked in AUTO-FILL, not the top bar
   let done = 0, shotsAttached = 0;
   for (const d of fresh) {
     const date = new Date(d.date);

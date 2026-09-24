@@ -412,6 +412,24 @@ input, select, textarea { font: inherit; }
 .af-img button { position: absolute; top: -6px; right: -6px; width: 22px; height: 22px; border-radius: 50%; background: var(--red); color: #fff; border: none; font-size: 11px; font-weight: 800; }
 .af-status { margin-top: 10px; font-size: 13px; color: var(--muted); }
 .af-status b { color: var(--lime); }
+/* v4.6.1 backtest target bar — where AUTO-FILL trades will land */
+.af-target {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 12px; padding: 8px 10px; font-size: 12px; color: var(--muted);
+  background: rgba(255,255,255,.03); border: 1px solid var(--border); border-radius: 10px;
+}
+.af-target select {
+  background: rgba(0,0,0,.3); color: var(--text, #fff); border: 1px solid var(--border);
+  border-radius: 8px; padding: 5px 8px; font-size: 12px; font-weight: 700; max-width: 60%;
+}
+.af-paper-tag { color: var(--gold); font-weight: 700; }
+/* v4.6.2 vision diagnostic rows */
+.probe-row { margin-top: 8px; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border); font-size: 12px; }
+.probe-row.ok { border-color: rgba(0,255,140,.45); background: rgba(0,255,140,.06); }
+.probe-row.bad { background: rgba(255,80,80,.06); }
+.probe-row .pr-top { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; justify-content: space-between; }
+.probe-row .pr-top b { font-size: 12px; }
+.probe-row .pr-sub { color: var(--muted); margin-top: 4px; font-size: 11px; }
 .draft-row { display: flex; align-items: center; gap: 10px; background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; flex-wrap: wrap; }
 .draft-row.dup { opacity: .45; border-style: dashed; }
 .draft-row .dr-main { flex: 1; min-width: 170px; }
