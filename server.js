@@ -150,16 +150,37 @@ function pendingShots() {
       .filter(s => s.size > 0 && s.size < 8e6); // v4.6.7: was 3MB — big PNGs were silently skipped and lost on redeploy
   } catch { return []; }
 }
-function decodeVaultShots(files) {
+/* v4.6.10: GitHub TRUNCATES gist file content above ~1MB in the listing. The old code saw
+   `truncated: true` and silently skipped those files — so every large screenshot sat safely
+   in the vault yet never came back, forever. Now we pull the raw URL to get the full bytes. */
+async function vaultRaw(fname) {
+  const owner = (gist.url || '').split('/')[3] || '';
+  if (!owner || !gist.id) return null;
+  try {
+    const r = await fetch(`https://gist.githubusercontent.com/${owner}/${gist.id}/raw/${fname}`, {
+      headers: { Authorization: 'Bearer ' + GIST_TOKEN, 'User-Agent': "Mo's Journal" },
+      signal: AbortSignal.timeout(45000),
+    });
+    if (!r.ok) return null;
+    return await r.text();
+  } catch (e) { return null; }
+}
+
+async function decodeVaultShots(files) {
   const vaulted = new Set(ensureVaultMeta());
   let n = 0;
-  for (const [fname, f] of Object.entries(files || {})) {
-    if (!fname.startsWith('img_') || !f || !f.content || f.truncated) continue;
+  const entries = Object.entries(files || {}).filter(([fn]) => fn.startsWith('img_'));
+  for (const [fname, f] of entries) {
     const name = fname.slice(4);
     if (!SHOT_EXT.test(name)) continue;
+    const onDisk = path.join(UPLOADS, name);
+    if (fs.existsSync(onDisk)) { vaulted.add(name); continue; } // already have it
+    let content = f && f.content;
+    if ((!content || f.truncated) && GIST_TOKEN) content = await vaultRaw(fname); // <— the fix
+    if (!content) continue;
     try {
       fs.mkdirSync(UPLOADS, { recursive: true });
-      fs.writeFileSync(path.join(UPLOADS, name), Buffer.from(String(f.content).replace(/\s+/g, ''), 'base64'));
+      fs.writeFileSync(onDisk, Buffer.from(String(content).replace(/\s+/g, ''), 'base64'));
       vaulted.add(name); n++;
     } catch (e) { console.error('vault shot decode failed:', fname, e.message); }
   }
@@ -245,7 +266,7 @@ async function gistBoot() {
         }
         state = incoming;
       }
-      decodeVaultShots(full.files);
+      await decodeVaultShots(full.files);
       gist.restored = true;
       console.log('☁️  Gist sync: ON (existing backup found)');
     } else {
@@ -577,6 +598,21 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: !!winner, provider: cfg.base, winner: winner?.model || '', results });
     }
 
+function missingShots() {
+  const out = [];
+  const seen = new Set();
+  for (const t of (state.trades || [])) {
+    for (const sh of (t.screenshots || [])) {
+      const url = typeof sh === 'string' ? sh : ((sh && sh.url) || '');
+      if (!url || !url.startsWith('/uploads/') || seen.has(url)) continue;
+      seen.add(url);
+      const name = path.basename(url);
+      if (!fs.existsSync(path.join(UPLOADS, name))) out.push({ trade: t.id, pair: t.pair, date: t.date, url, name });
+    }
+  }
+  return out;
+}
+
     /* v4.6.7: which screenshots referenced by trades are actually missing from disk?
        (Render wipes /uploads on deploy; anything too big to vault comes back 404.) */
     if (p === '/api/shots/status' && req.method === 'GET') {
@@ -638,6 +674,31 @@ const server = http.createServer(async (req, res) => {
         gist.remoteProfiles = state.profiles.length;
         scheduleSave();
         return send(res, 200, { ok: true, trades: state.trades.length, profiles: state.profiles.length });
+      } catch (e) { return send(res, 400, { ok: false, message: e.message }); }
+    }
+
+    /* v4.6.10: one tap to pull missing screenshots back out of the vault (raw fetch, so
+       even >1MB files that GitHub truncates in listings are recovered in full). */
+    if (p === '/api/shots/recover' && req.method === 'POST') {
+      if (!GIST_TOKEN) return send(res, 400, { ok: false, message: 'No GIST_TOKEN on this server.' });
+      try {
+        if (!gist.enabled) await gistBoot();
+        const missing = missingShots();
+        let recovered = 0; const stillGone = [];
+        for (const m of missing) {
+          const raw = await vaultRaw('img_' + m.name);
+          if (!raw) { stillGone.push(m); continue; }
+          try {
+            fs.mkdirSync(UPLOADS, { recursive: true });
+            fs.writeFileSync(path.join(UPLOADS, m.name), Buffer.from(String(raw).replace(/\s+/g, ''), 'base64'));
+            recovered++;
+          } catch (e) { stillGone.push(m); }
+        }
+        const vaulted = new Set(ensureVaultMeta());
+        missing.forEach(m => { if (!stillGone.includes(m)) vaulted.add(m.name); });
+        state.meta.vaultedShots = [...vaulted];
+        scheduleSave();
+        return send(res, 200, { ok: true, attempted: missing.length, recovered, stillGone: stillGone.length });
       } catch (e) { return send(res, 400, { ok: false, message: e.message }); }
     }
 

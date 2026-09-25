@@ -1160,6 +1160,7 @@ function renderSettings() {
       <div class="chips">
         <button class="btn btn-gold" onclick="backupNow()">☁️ Backup now</button>
         <button class="btn" onclick="checkShots()">🔎 Check screenshots</button>
+        <button class="btn btn-gold" onclick="recoverShots()">🩹 Recover missing</button>
         <button class="btn" onclick="exportJSON()">⬇️ Export JSON</button>
         <button class="btn" onclick="exportCSV()">⬇️ Export CSV</button>
         <button class="btn" onclick="document.getElementById('importFile').click()">⬆️ Import JSON</button>
@@ -1283,6 +1284,17 @@ window.restoreVersion = async (version, trades, profiles) => {
     if (out) out.innerHTML = `<b>✅ Restored — ${r.trades} trades, ${r.profiles} accounts are back.</b>`;
     toast(`⏳ Restored ${r.trades} trades`, 'gold');
   } catch (e) { if (out) out.innerHTML = `<span class="neg">✗ ${esc(e.message)}</span>`; }
+};
+window.recoverShots = async () => {
+  const el = $('#backupStatus'); if (el) el.innerHTML = '🩹 Pulling your screenshots back from the vault… ⏳';
+  try {
+    const r = await api('/api/shots/recover', 'POST');
+    const st = await api('/api/shots/status');
+    if (el) el.innerHTML = `<b>🩹 Recovered ${r.recovered} of ${r.attempted} missing screenshots.</b><br>
+      ${r.stillGone ? `<span style="color:var(--muted)">${r.stillGone} were never backed up (uploaded before the size fix) — open those trades and re-add them from your gallery. Everything new is safe.</span>` : `<span style="color:var(--muted)">All screenshots restored. Refresh the journal to see them.</span>`}
+      <br><span style="color:var(--muted)">Still missing on disk: ${st.missingCount}</span>`;
+    toast(`🩹 Recovered ${r.recovered} screenshots`, 'gold');
+  } catch (e) { if (el) el.innerHTML = `<span class="neg">✗ ${esc(e.message)}</span>`; }
 };
 window.checkShots = async () => {
   const el = $('#backupStatus'); if (el) el.innerHTML = '🔎 Checking screenshots…';
