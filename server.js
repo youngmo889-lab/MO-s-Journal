@@ -147,7 +147,7 @@ function pendingShots() {
     return fs.readdirSync(UPLOADS)
       .filter(n => SHOT_EXT.test(n) && !vaulted.has(n))
       .map(n => ({ name: n, size: fs.statSync(path.join(UPLOADS, n)).size }))
-      .filter(s => s.size > 0 && s.size < 3e6); // skip monsters
+      .filter(s => s.size > 0 && s.size < 8e6); // v4.6.7: was 3MB — big PNGs were silently skipped and lost on redeploy
   } catch { return []; }
 }
 function decodeVaultShots(files) {
@@ -225,6 +225,7 @@ async function gistBoot() {
     const found = list.find(g => g.files && g.files[GIST_FILE]);
     if (found) {
       gist.id = found.id;
+      gist.url = found.html_url || '';
       const full = await gh('https://api.github.com/gists/' + found.id);
       const content = full.files[GIST_FILE] && full.files[GIST_FILE].content;
       if (content && content.length > 10) {
@@ -258,6 +259,31 @@ async function gistBoot() {
 let gistTimer = null;
 // v4.6.0: extracted so /api/settings can flush the vault INSTANTLY on key save —
 // no 8s window where a Render nap can orphan a freshly minted key.
+
+/* v4.6.6 TIME MACHINE: write a DATED snapshot into the same private gist. The live file is
+   overwritten constantly, but snapshots are immutable — so a bad import or a wiped deploy
+   can always be rolled back. Keeps the newest 10; the AI key is stripped out of snapshots. */
+async function backupSnapshot() {
+  if (!GIST_TOKEN) throw new Error('GIST_TOKEN is not set on this server');
+  if (!gist.enabled) await gistBoot();
+  if (!gist.enabled) throw new Error('cloud vault unreachable right now');
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-'); // second-precision: two backups in one minute won't overwrite each other
+  const name = `mos-journal-snapshot-${stamp}.json`;
+  state.meta = state.meta || {};
+  const prev = Array.isArray(state.meta.snapshots) ? state.meta.snapshots : [];
+  const keep = [...prev, name].slice(-10);
+  const drop = prev.filter(n => !keep.includes(n));
+  const safe = JSON.parse(JSON.stringify(state));
+  if (safe.settings && safe.settings.ai) safe.settings.ai.key = ''; // never snapshot secrets
+  const files = { [name]: { content: JSON.stringify(safe) } };
+  drop.forEach(n => { files[n] = null; }); // null content = delete from the gist
+  await gh('https://api.github.com/gists/' + gist.id, { method: 'PATCH', body: JSON.stringify({ files }) });
+  state.meta.snapshots = keep;
+  state.meta.lastBackup = { at: Date.now(), trades: (state.trades || []).length, shots: ensureVaultMeta().length, snapshot: name };
+  scheduleSave();
+  return { at: state.meta.lastBackup.at, trades: state.meta.lastBackup.trades, shots: state.meta.lastBackup.shots, snapshot: name, kept: keep.length, url: gist.url || '' };
+}
+
 async function pushGistNow() {
   try {
       if (!gist.enabled) {
@@ -370,7 +396,11 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, pub);
     }
     if (p === '/api/meta' && req.method === 'GET') {
-      return send(res, 200, { version: 4, gistSync: gist.enabled, gistFound: !!gist.id, restored: !!gist.restored, aiConfigured: !!aiCfg().key, pixelVault: cloudReady() || gist.enabled, shotsVaulted: ensureVaultMeta().length });
+      const lb = (state.meta && state.meta.lastBackup) || null;
+      return send(res, 200, { version: 4, gistSync: gist.enabled, gistFound: !!gist.id, restored: !!gist.restored,
+        aiConfigured: !!aiCfg().key, pixelVault: cloudReady() || gist.enabled, shotsVaulted: ensureVaultMeta().length,
+        gistUrl: gist.url || '', trades: (state.trades || []).length,
+        snapshots: ((state.meta && state.meta.snapshots) || []).length, lastBackup: lb });
     }
 
     if (p === '/api/trade' && req.method === 'POST') {
@@ -514,6 +544,33 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { ok: !!winner, provider: cfg.base, winner: winner?.model || '', results });
     }
 
+    /* v4.6.7: which screenshots referenced by trades are actually missing from disk?
+       (Render wipes /uploads on deploy; anything too big to vault comes back 404.) */
+    if (p === '/api/shots/status' && req.method === 'GET') {
+      const missing = [];
+      const seen = new Set();
+      let total = 0;
+      for (const t of (state.trades || [])) {
+        for (const sh of (t.screenshots || [])) {
+          const url = typeof sh === 'string' ? sh : ((sh && sh.url) || '');
+          if (!url || seen.has(url)) continue;
+          seen.add(url); total++;
+          if (!url.startsWith('/uploads/')) continue;
+          const name = path.basename(url);
+          if (!fs.existsSync(path.join(UPLOADS, name))) missing.push({ trade: t.id, pair: t.pair, date: t.date, url });
+        }
+      }
+      return send(res, 200, { ok: true, total, missing, missingCount: missing.length });
+    }
+
+    if (p === '/api/backup' && req.method === 'POST') {
+      try {
+        await pushGistNow();          // sync the live copy first
+        const r = await backupSnapshot(); // then stamp an immutable dated snapshot
+        return send(res, 200, { ok: true, ...r });
+      } catch (e) { return send(res, 400, { ok: false, message: e.message }); }
+    }
+
     if (p === '/api/ai-test' && req.method === 'GET') {
       const cfg = aiCfg();
       if (!cfg.key) return send(res, 400, { ok: false, error: 'NO_KEY', message: 'No AI key configured yet.' });
@@ -570,7 +627,7 @@ const server = http.createServer(async (req, res) => {
       let transcript = '';
       if (shotParts.length) {
         try {
-          const ocr = await chatOnce(cfg, [{ type: 'text', text: AI_OCR_PROMPT }, ...shotParts], 2500, 60000);
+          const ocr = await chatOnce(cfg, [{ type: 'text', text: AI_OCR_PROMPT }, ...shotParts], 4000, 75000);
           if (ocr && ocr.trim().length >= 8) {
             transcript = ocr.trim();
             console.log(`🔍 OCR pass: ${transcript.length} chars transcribed from ${shotParts.length} image(s)`);
@@ -581,10 +638,11 @@ const server = http.createServer(async (req, res) => {
       const content = [{ type: 'text', text: AI_EXTRACT_PROMPT + (body.hint ? '\nContext from the trader: ' + String(body.hint).slice(0, 500) : '') }];
       if (transcript) {
         // reason over clean text instead of re-reading pixels — far fewer digit errors
-        content[0].text += `\n\n===== EXACT TEXT TRANSCRIBED FROM THE SCREENSHOT(S) =====\n${transcript.slice(0, 12000)}\n===== END TRANSCRIPTION =====\n`
+        content[0].text += `\n\n===== EXACT TEXT TRANSCRIBED FROM THE SCREENSHOT(S) =====\n${transcript.slice(0, 20000)}\n===== END TRANSCRIPTION =====\n`
           + 'Extract strictly from the transcription above. Copy every number EXACTLY as written (digit for digit, same decimal places). '
           + 'Do NOT round, convert, recalculate or "correct" any value. Use null for anything absent. '
           + 'If the transcription contains no trade data, return {"trades":[]}. Do not invent trades.'
+          + ' COMPLETENESS: extract EVERY trade row visible in the transcription — do not stop after a few, do not summarise, do not merge separate rows.'
           + 'SELF-CHECK before answering: every number you return MUST appear verbatim in the transcription above. '
           + 'If you cannot find a value written there, return null for it — never estimate, average or fill it in.'
       } else if (shotParts.length) {
@@ -611,7 +669,7 @@ const server = http.createServer(async (req, res) => {
           const r = await fetch(cfg.base + '/chat/completions', {
             method: 'POST',
             headers: aiHeaders(cfg),
-            body: JSON.stringify({ model, messages: [{ role: 'user', content }], temperature: 0, max_tokens: 3000 }), // v4.6.5: zero temperature — no creative drift on numbers
+            body: JSON.stringify({ model, messages: [{ role: 'user', content }], temperature: 0, max_tokens: 4000 }), // v4.6.8: room for every row in a dense statement
             signal: AbortSignal.timeout(90000),
           });
           if (r.ok) {

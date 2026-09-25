@@ -1156,7 +1156,10 @@ function renderSettings() {
       <div style="font-size:13px;color:var(--muted);margin-bottom:12px">
         Your journal (all accounts) lives on this server — same link on PC and phone. <b>Tip:</b> "Add to Home Screen" on your phone for an app icon. 📲
       </div>
+      <div id="backupStatus" class="af-status" style="margin:0 0 10px">Checking backup status…</div>
       <div class="chips">
+        <button class="btn btn-gold" onclick="backupNow()">☁️ Backup now</button>
+        <button class="btn" onclick="checkShots()">🔎 Check screenshots</button>
         <button class="btn" onclick="exportJSON()">⬇️ Export JSON</button>
         <button class="btn" onclick="exportCSV()">⬇️ Export CSV</button>
         <button class="btn" onclick="document.getElementById('importFile').click()">⬆️ Import JSON</button>
@@ -1175,6 +1178,7 @@ function renderSettings() {
   api('/api/meta').then(m => {
     const f = $('#gistFlag');
     if (f) f.textContent = m.gistSync ? '☁️ cloud backup: ON (GitHub Gist)' : '💾 local disk backup (export regularly!)';
+    renderBackupStatus(m);
   }).catch(() => {});
   $$('#aiPresetChips .chip-toggle').forEach(b => b.onclick = () => {
     $$('#aiPresetChips .chip-toggle').forEach(x => x.classList.remove('on'));
@@ -1233,6 +1237,47 @@ window.applyModel = async m => {
   go('settings');
 };
 
+function ago(ts) {
+  if (!ts) return 'never';
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.round(s / 60) + ' min ago';
+  if (s < 86400) return Math.round(s / 3600) + 'h ago';
+  return Math.round(s / 86400) + 'd ago';
+}
+function renderBackupStatus(m) {
+  const el = $('#backupStatus'); if (!el) return;
+  if (!m.gistSync) { el.innerHTML = '<span class="neg">⚠️ Cloud backup OFF — add GIST_TOKEN on Render. Until then, export a JSON after every session.</span>'; return; }
+  const lb = m.lastBackup;
+  el.innerHTML = `<b>☁️ Cloud backup: ON</b> · ${m.trades} trade${m.trades === 1 ? '' : 's'} · ${m.shotsVaulted} screenshot${m.shotsVaulted === 1 ? '' : 's'} vaulted · ${m.snapshots} snapshot${m.snapshots === 1 ? '' : 's'}<br>
+    <span style="color:var(--muted)">Last snapshot: <b>${lb ? ago(lb.at) : 'none yet'}</b>${lb ? ` (${lb.trades} trades)` : ''} · auto-syncs ~8s after every change
+    ${m.gistUrl ? ` · <a href="${esc(m.gistUrl)}" target="_blank" style="color:var(--gold)">open vault ↗</a>` : ''}</span>`;
+}
+window.checkShots = async () => {
+  const el = $('#backupStatus'); if (el) el.innerHTML = '🔎 Checking screenshots…';
+  try {
+    const r = await api('/api/shots/status');
+    if (!r.missingCount) {
+      if (el) el.innerHTML = `<b>✅ All ${r.total} screenshots are present on the server.</b><br><span style="color:var(--muted)">If one still won't display, pull to refresh — your browser cached the old broken link.</span>`;
+      toast('✅ All screenshots present');
+    } else {
+      if (el) el.innerHTML = `<span class="neg">⚠️ ${r.missingCount} of ${r.total} screenshots are missing from the server.</span><br>
+        <span style="color:var(--muted)">These were uploaded before the fix, so they were too big to back up. Open each trade below and re-add them — new uploads are safe.</span>
+        <div style="margin-top:8px">${r.missing.slice(0, 12).map(m => `<div class="pr-sub">· ${esc(m.pair || 'trade')} — ${fmtDate(m.date) || ''} <button class="btn btn-ghost" style="padding:3px 8px;margin-left:6px" onclick="closeModal();openTradeForm('${m.trade}')">fix ↗</button></div>`).join('')}</div>`;
+    }
+  } catch (e) { if (el) el.innerHTML = `<span class="neg">✗ ${esc(e.message)}</span>`; }
+};
+window.backupNow = async () => {
+  const el = $('#backupStatus'); if (el) el.innerHTML = '☁️ Backing up… ⏳';
+  try {
+    const r = await api('/api/backup', 'POST');
+    const m = await api('/api/meta');
+    renderBackupStatus(m);
+    toast(`☁️ Backed up — ${r.trades} trades, ${r.shots} screenshots`, 'gold');
+  } catch (e) {
+    if (el) el.innerHTML = `<span class="neg">✗ Backup failed: ${esc(e.message)}</span>`;
+  }
+};
 window.removeRule = async i => { S.settings.rules.splice(i, 1); await api('/api/settings', 'POST', S.settings); renderAll(); };
 window.addRule = async () => {
   const v = $('#newRule').value.trim(); if (!v) return;
@@ -1583,11 +1628,8 @@ function wireAutofill() {
         if (files.length > room) toast(`📸 Max ${AF_MAX_SHOTS} screenshots per batch — extra ${files.length - room} skipped`);
         for (const f of files.slice(0, room)) {
           try {
-            // v4.6.4 ACCURACY FIRST: JPEG artefacts smear small price digits and the model
-            // misreads them (that's the "wrong numbers" bug). PNG is lossless, so 6350.20
-            // can't morph into 6350.26. Bigger payload, trustworthy numbers — worth it.
-            const data = await compressImage(f, 1800, 0.95, 'image/png');
-            af.images.push({ data, ext: '.png', preview: (data.startsWith('data:') ? '' : 'data:image/png;base64,') + data });
+            const enc = await encodeForAI(f);
+            af.images.push({ data: enc.data, ext: enc.ext, preview: enc.preview });
           } catch (err) { toast('⚠️ Couldn\'t read an image'); }
         }
         e.target.value = '';
@@ -1642,7 +1684,23 @@ function wireAutofill() {
         renderAutofill();
       } else if (af.method === 'shots') {
         if (!af.images.length) return toast('⚠️ Add a screenshot first');
-        runAIParse({ images: af.images.map(i => ({ data: i.data, ext: i.ext })) });
+        const originals = af.images.map(i => ({ data: i.data, ext: i.ext, preview: i.preview }));
+        const status = $('#afStatus');
+        if (status) status.innerHTML = 'Preparing screenshots for the most accurate read… 🔍';
+        // v4.6.8: split big/dense shots into bands so the OCR reads each at full detail.
+        // Only tile when every shot still fits in the send budget (8) — coverage of ALL
+        // screenshots always beats sharper reading of some.
+        const MAX_SENT = 12; // matches AF_MAX_SHOTS — every screenshot is always sent
+        let analysis = [];
+        const canTileAll = originals.length * 2 <= MAX_SENT;
+        if (canTileAll) {
+          for (const im of originals) analysis.push(...await tilesForAnalysis(im, MAX_SENT - analysis.length));
+        } else {
+          analysis = originals.slice(0, MAX_SENT);
+        }
+        analysis = analysis.slice(0, MAX_SENT);
+        if (analysis.length > originals.length && status) status.innerHTML = `🔍 Split ${originals.length} large screenshot${originals.length > 1 ? 's' : ''} into ${analysis.length} bands for a sharper read… ⏳`;
+        runAIParse({ images: analysis, attach: originals });
       }
     };
   }
@@ -1674,7 +1732,7 @@ function rawTradeSame(a, b) {
   return ta === tb || !ta || !tb;
 }
 
-async function runAIParse({ images = [], text = '' }) {
+async function runAIParse({ images = [], text = '', attach = null }) {
   const af = S.af;
   const status = $('#afStatus'), go = $('#afGo');
   af.busy = true;
@@ -1725,7 +1783,7 @@ async function runAIParse({ images = [], text = '' }) {
       return normalizeDraftForApp(d2);
     }).filter(Boolean);
     af.drafts = markDups(raw);
-    if (images.length) af.drafts.forEach(d => { d._shots = images; }); // same-setup batches: every trade shares the evidence
+    if ((attach || images).length) af.drafts.forEach(d => { d._shots = attach || images; }); // always save the ORIGINALS, never the tiles
     af.status = raw.length ? '' : 'The AI looked but found no trades it trusted. Add a hint or a clearer crop.';
     renderAutofill();
   } catch (e) {
@@ -1789,11 +1847,28 @@ window.afReview = (i) => {
   if (!d || d.dup) return;
   openTradeForm(null, d);
 };
+/* v4.6.7: the AI gets a lossless PNG (accuracy), but the copy we SAVE is a compact JPEG.
+   Reason: the cloud vault only carries files under 3MB, so a 5MB PNG never got backed up —
+   and Render wipes /uploads on every deploy. Small JPEGs always vault, always survive. */
+async function toStorageImage(sh) {
+  if (sh.ext !== '.png') return { data: sh.data, ext: sh.ext || '.jpg' };
+  try {
+    const src = (sh.preview && sh.preview.startsWith('data:')) ? sh.preview : 'data:image/png;base64,' + sh.data;
+    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = src; });
+    const scale = Math.min(1, 1600 / Math.max(img.width, img.height)); // v4.6.8: store a sharper copy — still ~500KB, always vaults
+    const cv = document.createElement('canvas');
+    cv.width = Math.round(img.width * scale); cv.height = Math.round(img.height * scale);
+    cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+    return { data: cv.toDataURL('image/jpeg', 0.9).split(',')[1], ext: '.jpg' };
+  } catch (e) { return { data: sh.data, ext: sh.ext || '.jpg' }; }
+}
+
 async function uploadStagedShots(shots) {
   const out = [];
   for (const sh of shots) {
     try {
-      const res = await api('/api/upload', 'POST', { data: sh.data, ext: sh.ext || '.jpg' });
+      const store = await toStorageImage(sh);
+      const res = await api('/api/upload', 'POST', { data: store.data, ext: store.ext });
       out.push({ url: res.url, cat: 'Analysis', caption: '' });
     } catch (e) { /* screenshot attach is best-effort */ }
   }
@@ -2016,6 +2091,73 @@ function renderShotRows() {
     </div>`).join('');
 }
 window.shotsTmp = shotsTmp;
+
+/* v4.6.8 — accuracy without losing the vault.
+   • PC screenshots stay near-native (up to 2400px) so dense history tables stay legible
+   • Lossless PNG whenever the payload fits; high-quality JPEG only as a size safety valve
+   • Tiny phone crops get gently upscaled — 12B vision models read small text better when
+     it is actually large
+   Storage is a separate, compact copy (see toStorageImage) so nothing here risks the vault. */
+const AI_MAX_PNG_BYTES = 3.5e6;
+function loadImg(src) {
+  return new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = src; });
+}
+function encodeCanvas(cv, mime, q) { return { b64: cv.toDataURL(mime, q).split(',')[1], mime }; }
+async function encodeForAI(file) {
+  try {
+    const raw = await new Promise((res, rej) => {
+      const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file);
+    });
+    const img = await loadImg(raw);
+    const long = Math.max(img.width, img.height);
+    // keep native resolution unless it is genuinely huge; upscale very small crops
+    let scale = long > 2400 ? 2400 / long : (long < 1000 ? Math.min(2, 1400 / long) : 1);
+    const cv = document.createElement('canvas');
+    cv.width = Math.round(img.width * scale); cv.height = Math.round(img.height * scale);
+    const ctx = cv.getContext('2d');
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, cv.width, cv.height);
+    let out = encodeCanvas(cv, 'image/png');
+    if (out.b64.length * 0.75 > AI_MAX_PNG_BYTES) out = encodeCanvas(cv, 'image/jpeg', 0.92); // size safety valve
+    const ext = out.mime === 'image/png' ? '.png' : '.jpg';
+    return { data: out.b64, ext, preview: 'data:' + out.mime + ';base64,' + out.b64 };
+  } catch (e) {
+    const data = await compressImage(file, 1800, 0.95, 'image/png');
+    return { data, ext: '.png', preview: 'data:image/png;base64,' + data };
+  }
+}
+
+/* v4.6.8 TILING: a tall phone screenshot of a trade history, or a wide PC statement, packs
+   far more text than one pass can read cleanly. Splitting along the long axis (with a small
+   overlap so no row is cut in half) lets the OCR read each band at full detail. */
+async function tilesForAnalysis(im, budget) {
+  try {
+    const src = (im.preview && im.preview.startsWith('data:')) ? im.preview : 'data:image/png;base64,' + im.data;
+    const img = await loadImg(src);
+    const area = img.width * img.height;
+    const long = Math.max(img.width, img.height);
+    if (budget <= 0 || area < 1.2e6 || long < 1400) return [im];   // small/clean → send whole
+    const vertical = img.height >= img.width;
+    const overlap = Math.round(long * 0.08);
+    const half = Math.ceil((long + overlap) / 2);
+    const tiles = [];
+    for (let i = 0; i < 2; i++) {
+      const start = Math.max(0, i * (half - overlap));
+      const sw = vertical ? img.width : Math.min(half, img.width - start);
+      const sh = vertical ? Math.min(half, img.height - start) : img.height;
+      if (sw <= 0 || sh <= 0) continue;
+      const cv = document.createElement('canvas');
+      cv.width = sw; cv.height = sh;
+      const ctx = cv.getContext('2d');
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, vertical ? 0 : start, vertical ? start : 0, sw, sh, 0, 0, sw, sh);
+      let out = encodeCanvas(cv, 'image/png');
+      if (out.b64.length * 0.75 > AI_MAX_PNG_BYTES) out = encodeCanvas(cv, 'image/jpeg', 0.92);
+      tiles.push({ data: out.b64, ext: out.mime === 'image/png' ? '.png' : '.jpg' });
+    }
+    return tiles.length === 2 ? tiles : [im];
+  } catch (e) { return [im]; }
+}
 
 function compressImage(file, maxDim = 1600, quality = 0.82, mime = 'image/jpeg') {
   return new Promise((resolve, reject) => {
