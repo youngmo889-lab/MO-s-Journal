@@ -1167,6 +1167,12 @@ function renderSettings() {
       </div>
     </div>
     <div class="card">
+      <div class="card-title">⏳ Time Machine — restore a previous version</div>
+      <div class="hint" style="margin-bottom:10px;color:var(--muted);font-size:12px">Every save to your vault is kept forever. If trades ever go missing, pull them back from any point in time.</div>
+      <div class="chips"><button class="btn btn-gold" onclick="openTimeMachine()">⏳ Browse saved versions</button></div>
+      <div class="af-status" id="tmOut"></div>
+    </div>
+    <div class="card">
       <div class="card-title">🧪 Playground</div>
       <div class="chips">
         <button class="btn btn-gold" onclick="loadDemo()">🎲 Load demo trades</button>
@@ -1253,6 +1259,31 @@ function renderBackupStatus(m) {
     <span style="color:var(--muted)">Last snapshot: <b>${lb ? ago(lb.at) : 'none yet'}</b>${lb ? ` (${lb.trades} trades)` : ''} · auto-syncs ~8s after every change
     ${m.gistUrl ? ` · <a href="${esc(m.gistUrl)}" target="_blank" style="color:var(--gold)">open vault ↗</a>` : ''}</span>`;
 }
+window.openTimeMachine = async () => {
+  const out = $('#tmOut'); if (out) out.innerHTML = '⏳ Reading vault history…';
+  let r;
+  try { r = await api('/api/timemachine'); }
+  catch (e) { if (out) out.innerHTML = `<span class="neg">✗ ${esc(e.message)}</span>`; return; }
+  if (!r.revisions || !r.revisions.length) { if (out) out.innerHTML = 'No history found yet — hit ☁️ Backup now to create your first restore point.'; return; }
+  if (out) out.innerHTML = `<div class="pr-sub" style="margin-bottom:6px">Currently loaded: <b>${r.current.trades} trades · ${r.current.profiles} accounts</b></div>`
+    + r.revisions.map(v => `
+      <div class="probe-row ${v.trades > r.current.trades ? 'ok' : ''}">
+        <div class="pr-top"><b>${v.trades} trades · ${v.profiles} accounts · ${v.shots} shots</b>
+          <span style="color:var(--muted)">${new Date(v.at).toLocaleString()}</span></div>
+        <button class="btn ${v.trades > r.current.trades ? 'btn-gold' : ''}" style="padding:5px 10px;margin-top:6px"
+          onclick="restoreVersion('${v.version}', ${v.trades}, ${v.profiles})">Restore this version ↩️</button>
+      </div>`).join('');
+};
+window.restoreVersion = async (version, trades, profiles) => {
+  if (!confirm(`Restore this version? It has ${trades} trades and ${profiles} accounts. Your current journal will be replaced.`)) return;
+  const out = $('#tmOut'); if (out) out.innerHTML = '↩️ Restoring…';
+  try {
+    const r = await api('/api/timemachine/restore', 'POST', { version });
+    await loadState(); renderAll();
+    if (out) out.innerHTML = `<b>✅ Restored — ${r.trades} trades, ${r.profiles} accounts are back.</b>`;
+    toast(`⏳ Restored ${r.trades} trades`, 'gold');
+  } catch (e) { if (out) out.innerHTML = `<span class="neg">✗ ${esc(e.message)}</span>`; }
+};
 window.checkShots = async () => {
   const el = $('#backupStatus'); if (el) el.innerHTML = '🔎 Checking screenshots…';
   try {

@@ -263,6 +263,31 @@ let gistTimer = null;
 /* v4.6.6 TIME MACHINE: write a DATED snapshot into the same private gist. The live file is
    overwritten constantly, but snapshots are immutable — so a bad import or a wiped deploy
    can always be rolled back. Keeps the newest 10; the AI key is stripped out of snapshots. */
+/* Read ONLY the data file from the vault (raw URL — avoids pulling every screenshot). */
+async function peekRemote() {
+  try {
+    const owner = (gist.url || '').split('/')[3] || '';
+    if (!gist.id || !owner) return null;
+    const url = `https://gist.githubusercontent.com/${owner}/${gist.id}/raw/${GIST_FILE}`;
+    const r = await fetch(url, { headers: { Authorization: 'Bearer ' + GIST_TOKEN, 'User-Agent': "Mo's Journal" }, signal: AbortSignal.timeout(20000) });
+    if (!r.ok) return null;
+    const j = JSON.parse(await r.text());
+    return { trades: (j.trades || []).length, profiles: (j.profiles || []).length };
+  } catch (e) { return null; }
+}
+/* v4.6.9 TIME MACHINE: every gist save is a git commit, so the whole history is still there. */
+async function gistRevisions(limit = 12) {
+  const c = await gh(`https://api.github.com/gists/${gist.id}/commits`);
+  return (c || []).slice(0, limit).map(x => ({ version: x.version, at: x.committed_at }));
+}
+async function gistRevisionData(version) {
+  const owner = (gist.url || '').split('/')[3] || '';
+  const url = `https://gist.githubusercontent.com/${owner}/${gist.id}/raw/${version}/${GIST_FILE}`;
+  const r = await fetch(url, { headers: { Authorization: 'Bearer ' + GIST_TOKEN, 'User-Agent': "Mo's Journal" }, signal: AbortSignal.timeout(30000) });
+  if (!r.ok) throw new Error('could not read that revision (' + r.status + ')');
+  return JSON.parse(await r.text());
+}
+
 async function backupSnapshot() {
   if (!GIST_TOKEN) throw new Error('GIST_TOKEN is not set on this server');
   if (!gist.enabled) await gistBoot();
@@ -297,12 +322,20 @@ async function pushGistNow() {
         if (!gist.enabled) { console.log('☁️  vault still unreachable — holding data locally, will retry.'); return; }
         scheduleSave(); // state may have been restored — persist it locally too
       }
-      // v4.6.3 WIPE GUARD: a fresh deploy boots with an empty local state. If the gist link
-      // blinked at that moment, the old code would push that emptiness straight over a
-      // populated vault — that is exactly how the journal went to 0 trades. Never again:
-      // refuse to write an EMPTY journal over a vault that demonstrably has trades.
-      if (gist.remoteTrades > 0 && (state.trades || []).length === 0 && !state.__allowWipe) {
-        console.log(`🛡️  WIPE GUARD: refusing to overwrite vault (${gist.remoteTrades} trades) with an empty journal — holding local.`);
+      // v4.6.9 WIPE GUARD (hardened): v4.6.3 only knew the vault's contents if the boot
+      // restore had ALREADY succeeded. When the boot handshake blinked, remoteTrades was
+      // unknown, the check sailed through, and an empty journal overwrote everything.
+      // Now we LOOK before every write, and compare profiles too — not just trades.
+      if (gist.remoteTrades == null) {
+        const rem = await peekRemote();
+        if (rem) { gist.remoteTrades = rem.trades; gist.remoteProfiles = rem.profiles; }
+      }
+      const localTrades = (state.trades || []).length;
+      const localProfiles = (state.profiles || []).length;
+      const richerRemote = (gist.remoteTrades > 0 && localTrades === 0)
+        || (gist.remoteProfiles > localProfiles && localTrades === 0);
+      if (richerRemote && !state.__allowWipe) {
+        console.log(`🛡️  WIPE GUARD: refusing to overwrite vault (${gist.remoteTrades} trades, ${gist.remoteProfiles} accounts) with an empty journal — holding local.`);
         return;
       }
       if (state.__allowWipe) delete state.__allowWipe;
@@ -561,6 +594,51 @@ const server = http.createServer(async (req, res) => {
         }
       }
       return send(res, 200, { ok: true, total, missing, missingCount: missing.length });
+    }
+
+    /* v4.6.9 TIME MACHINE — list every version ever saved to the vault, with trade counts. */
+    if (p === '/api/timemachine' && req.method === 'GET') {
+      if (!GIST_TOKEN) return send(res, 400, { ok: false, message: 'No GIST_TOKEN on this server — no history to read.' });
+      try {
+        if (!gist.enabled) { await gistBoot(); }
+        if (!gist.enabled || !gist.id) return send(res, 400, { ok: false, message: 'Cloud vault unreachable right now.' });
+        const revs = await gistRevisions(12);
+        const out = [];
+        const t0 = Date.now();
+        for (const rv of revs) {
+          if (Date.now() - t0 > 25000) break; // don't hang the phone
+          try {
+            const d = await gistRevisionData(rv.version);
+            out.push({ version: rv.version, at: rv.at, trades: (d.trades || []).length, profiles: (d.profiles || []).length, shots: ((d.meta && d.meta.vaultedShots) || []).length });
+          } catch (e) { /* skip unreadable revision */ }
+        }
+        return send(res, 200, { ok: true, current: { trades: (state.trades || []).length, profiles: (state.profiles || []).length }, revisions: out });
+      } catch (e) { return send(res, 400, { ok: false, message: e.message }); }
+    }
+
+    /* v4.6.9: roll the journal back to any saved version. */
+    if (p === '/api/timemachine/restore' && req.method === 'POST') {
+      const body = await readBody(req).catch(() => ({}));
+      const version = String(body.version || '');
+      if (!version) return send(res, 400, { ok: false, message: 'No version given.' });
+      try {
+        try { await backupSnapshot(); } catch (e) { console.log('pre-restore snapshot skipped:', e.message); }
+        const d = await gistRevisionData(version);
+        state.trades = Array.isArray(d.trades) ? d.trades : [];
+        state.profiles = Array.isArray(d.profiles) ? d.profiles : state.profiles;
+        state.meta = { ...(state.meta || {}), ...(d.meta || {}) };
+        if (d.settings && typeof d.settings === 'object') {
+          const keepKey = (state.settings && state.settings.ai && state.settings.ai.key) || '';
+          state.settings = d.settings;
+          if (state.settings.ai && keepKey) state.settings.ai.key = keepKey; // never lose the key
+        }
+        migrate(state);
+        state.__allowWipe = true; // this IS the deliberate restore
+        gist.remoteTrades = state.trades.length;
+        gist.remoteProfiles = state.profiles.length;
+        scheduleSave();
+        return send(res, 200, { ok: true, trades: state.trades.length, profiles: state.profiles.length });
+      } catch (e) { return send(res, 400, { ok: false, message: e.message }); }
     }
 
     if (p === '/api/backup' && req.method === 'POST') {
