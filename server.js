@@ -87,7 +87,7 @@ Rules:
 Output plain text only — no markdown, no explanation.`;
 
 const AI_EXTRACT_PROMPT = `You are the extraction engine of a trading journal. Read the broker screenshot(s)/history and return ONLY a JSON object (no markdown, no prose):
-{"trades":[{"pair":"Volatility 75","dir":"long","lots":1,"entry":6350.2,"exit":6358.7,"sl":6345.2,"tp":6360.2,"openTime":"2026-09-19 09:14","closeTime":"2026-09-19 15:40","pnl":8.5,"setup":"Break & retest","broker":"Weltrade"}]}
+{"trades":[{"pair":"Volatility 75","dir":"long","lots":1,"entry":6350.2,"exit":6358.7,"sl":6345.2,"tp":6360.2,"openTime":"2026-09-19 09:14","closeTime":"2026-09-19 15:40","pnl":8.5,"setup":"Break & retest","broker":"Weltrade","ticket":"51829374","comment":""}]}
 Rules: dir must be "long" (buy) or "short" (sell). Use 24h times, numbers without currency symbols, null for anything not visible. If the image shows a history/statement, extract EVERY trade row. If the image is a chart with an open/closed position, extract what's shown (prices, symbol, size). "setup" = strategy name only if annotated on the chart, else null. Return {"trades":[]} if nothing trade-like is visible.
 BACKTEST / CHART-ONLY SCREENSHOTS (very common): the trader screenshots a chart with horizontal lines or zones drawn for entry, stop-loss and take-profit, and possibly arrows or a shaded risk box. Read those drawn levels as entry/sl/tp. Also read any text labels on the chart (e.g. "sell", "entry 6350.2", "SL", "TP1", "BOS", "OB") and any profit/loss figure printed on screen.
 NEVER GUESS OR INVENT A NUMBER. Accuracy matters more than completeness — a wrong P&L corrupts the trader's statistics. If a price/level is not clearly visible, use null; do not infer it from other numbers. If the chart shows a planned or still-open trade with no visible exit, leave exit and pnl null. If lot size is not shown, use null (never assume 1). If no date is visible anywhere, leave openTime/closeTime null rather than using today's date.`;
@@ -766,7 +766,7 @@ function missingShots() {
       let transcript = '';
       if (shotParts.length) {
         try {
-          const ocr = await chatOnce(cfg, [{ type: 'text', text: AI_OCR_PROMPT }, ...shotParts], 4000, 75000);
+          const ocr = await chatOnce(cfg, [{ type: 'text', text: AI_OCR_PROMPT }, ...shotParts], 8000, 90000);
           if (ocr && ocr.trim().length >= 8) {
             transcript = ocr.trim();
             console.log(`🔍 OCR pass: ${transcript.length} chars transcribed from ${shotParts.length} image(s)`);
@@ -777,11 +777,15 @@ function missingShots() {
       const content = [{ type: 'text', text: AI_EXTRACT_PROMPT + (body.hint ? '\nContext from the trader: ' + String(body.hint).slice(0, 500) : '') }];
       if (transcript) {
         // reason over clean text instead of re-reading pixels — far fewer digit errors
-        content[0].text += `\n\n===== EXACT TEXT TRANSCRIBED FROM THE SCREENSHOT(S) =====\n${transcript.slice(0, 20000)}\n===== END TRANSCRIPTION =====\n`
+        content[0].text += `\n\n===== EXACT TEXT TRANSCRIBED FROM THE SCREENSHOT(S) =====\n${transcript.slice(0, 30000)}\n===== END TRANSCRIPTION =====\n`
           + 'Extract strictly from the transcription above. Copy every number EXACTLY as written (digit for digit, same decimal places). '
           + 'Do NOT round, convert, recalculate or "correct" any value. Use null for anything absent. '
           + 'If the transcription contains no trade data, return {"trades":[]}. Do not invent trades.'
           + ' COMPLETENESS: extract EVERY trade row visible in the transcription — do not stop after a few, do not summarise, do not merge separate rows.'
+          + ' BEFORE / AFTER SETS: these screenshots are often one batch showing the same trade at different moments — a setup shot (entry, SL, TP, the plan) and an outcome shot (exit, result, P&L). '
+          + 'When two images show the SAME symbol and the SAME direction, MERGE them into ONE trade: take entry/sl/tp/openTime from the setup shot and exit/closeTime/pnl from the outcome shot. '
+          + 'Only keep them separate if they are clearly different trades (different symbol, direction, or time).'
+          + ' Also capture ticket/order number and any Comment column when present.'
           + 'SELF-CHECK before answering: every number you return MUST appear verbatim in the transcription above. '
           + 'If you cannot find a value written there, return null for it — never estimate, average or fill it in.'
       } else if (shotParts.length) {
@@ -808,7 +812,7 @@ function missingShots() {
           const r = await fetch(cfg.base + '/chat/completions', {
             method: 'POST',
             headers: aiHeaders(cfg),
-            body: JSON.stringify({ model, messages: [{ role: 'user', content }], temperature: 0, max_tokens: 4000 }), // v4.6.8: room for every row in a dense statement
+            body: JSON.stringify({ model, messages: [{ role: 'user', content }], temperature: 0, max_tokens: 6000 }), // v4.6.11: room for every row in a dense MT5 statement
             signal: AbortSignal.timeout(90000),
           });
           if (r.ok) {

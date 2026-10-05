@@ -1509,7 +1509,7 @@ window.openAddChooser = () => {
 };
 
 const AF_MAX_SHOTS = 12;   // AUTO-FILL batch ceiling — parsed in rounds of 4 (free-tier vision safe)
-const AF_BATCH = 2;   // v4.6.5: fewer images per request = more model attention per shot = fewer misread digits
+const AF_BATCH = 8;   // v4.6.11: before/after shots only make sense together — send the SET, not pairs
 
 window.openAutofill = () => {
   S.af = { method: null, images: [], text: '', hint: '', drafts: null, busy: false, status: '', via: '' };
@@ -1733,14 +1733,16 @@ function wireAutofill() {
         // v4.6.8: split big/dense shots into bands so the OCR reads each at full detail.
         // Only tile when every shot still fits in the send budget (8) — coverage of ALL
         // screenshots always beats sharper reading of some.
-        const MAX_SENT = 12; // matches AF_MAX_SHOTS — every screenshot is always sent
+        const MAX_SENT = 8;                                  // server accepts 8 images per request
+        const TOTAL_BYTES = 10e6;                            // keep the payload uploadable
+        const capBytes = Math.max(6e5, Math.min(3.5e6, TOTAL_BYTES / Math.max(1, originals.length)));
         let analysis = [];
-        const canTileAll = originals.length * 2 <= MAX_SENT;
-        if (canTileAll) {
-          for (const im of originals) analysis.push(...await tilesForAnalysis(im, MAX_SENT - analysis.length));
-        } else {
-          analysis = originals.slice(0, MAX_SENT);
+        for (const im of originals) {
+          const slots = MAX_SENT - analysis.length;
+          if (slots <= 0) break;
+          analysis.push(...await tilesForAnalysis(im, slots, capBytes));
         }
+        if (!analysis.length) analysis = originals.slice(0, MAX_SENT);
         analysis = analysis.slice(0, MAX_SENT);
         if (analysis.length > originals.length && status) status.innerHTML = `🔍 Split ${originals.length} large screenshot${originals.length > 1 ? 's' : ''} into ${analysis.length} bands for a sharper read… ⏳`;
         runAIParse({ images: analysis, attach: originals });
@@ -1822,6 +1824,8 @@ async function runAIParse({ images = [], text = '', attach = null }) {
         closedAt: window.MJParse ? MJParse.isoFromLoose(d.closeTime || d.closedAt) : (d.closedAt || ''),
         pnl: d.pnl ?? d.profit,
         setup: d.setup || '',
+        ticket: d.ticket ?? d.order ?? d.position ?? null,
+        comment: d.comment || d.notes || '',
       };
       return normalizeDraftForApp(d2);
     }).filter(Boolean);
@@ -1941,7 +1945,9 @@ window.afImportAll = async () => {
       pnl: d.pnl, pnlOverridden: d.pnl != null && d.pnl !== d.pnlEstimated,
       riskAmount: d.riskAmount, rMultiple: d.rMultiple, rrPlanned: d.rrPlanned,
       session: blockFromHour(date.getHours()), setup: d.setup || '',
-      rules: {}, mistakes: [], lesson: '', notes: '', screenshots: [],
+      rules: {}, mistakes: [], lesson: '',
+      notes: [d.ticket ? 'Ticket ' + d.ticket : '', d.comment || ''].filter(Boolean).join(' · '),
+      screenshots: [],
       wave: d.wave || null, waveRole: d.waveRole || null,
       imported: true,
     };
@@ -2173,33 +2179,62 @@ async function encodeForAI(file) {
 /* v4.6.8 TILING: a tall phone screenshot of a trade history, or a wide PC statement, packs
    far more text than one pass can read cleanly. Splitting along the long axis (with a small
    overlap so no row is cut in half) lets the OCR read each band at full detail. */
-async function tilesForAnalysis(im, budget) {
+async function tilesForAnalysis(im, slots, capBytes) {
   try {
     const src = (im.preview && im.preview.startsWith('data:')) ? im.preview : 'data:image/png;base64,' + im.data;
     const img = await loadImg(src);
     const area = img.width * img.height;
     const long = Math.max(img.width, img.height);
-    if (budget <= 0 || area < 1.2e6 || long < 1400) return [im];   // small/clean → send whole
+    // small or already-legible → send whole; big/dense → split into up to 4 overlapping bands
+    if (slots < 2 || area < 1.0e6 || long < 1200) return [await refit(im, capBytes)];
+    const n = Math.max(2, Math.min(slots, Math.min(4, Math.round(area / 0.9e6))));
     const vertical = img.height >= img.width;
     const overlap = Math.round(long * 0.08);
-    const half = Math.ceil((long + overlap) / 2);
+    const seg = Math.ceil((long + overlap * (n - 1)) / n);
+    const step = seg - overlap;
     const tiles = [];
-    for (let i = 0; i < 2; i++) {
-      const start = Math.max(0, i * (half - overlap));
-      const sw = vertical ? img.width : Math.min(half, img.width - start);
-      const sh = vertical ? Math.min(half, img.height - start) : img.height;
+    for (let i = 0; i < n; i++) {
+      const start = Math.min(i * step, Math.max(0, long - seg));
+      const sw = vertical ? img.width : Math.min(seg, img.width - start);
+      const sh = vertical ? Math.min(seg, img.height - start) : img.height;
       if (sw <= 0 || sh <= 0) continue;
       const cv = document.createElement('canvas');
       cv.width = sw; cv.height = sh;
       const ctx = cv.getContext('2d');
       ctx.imageSmoothingQuality = 'high';
       ctx.drawImage(img, vertical ? 0 : start, vertical ? start : 0, sw, sh, 0, 0, sw, sh);
-      let out = encodeCanvas(cv, 'image/png');
-      if (out.b64.length * 0.75 > AI_MAX_PNG_BYTES) out = encodeCanvas(cv, 'image/jpeg', 0.92);
+      const out = fitEncode(cv, capBytes);
       tiles.push({ data: out.b64, ext: out.mime === 'image/png' ? '.png' : '.jpg' });
     }
-    return tiles.length === 2 ? tiles : [im];
+    return tiles.length ? tiles : [await refit(im, capBytes)];
   } catch (e) { return [im]; }
+}
+
+/* Keep total payload sane: PNG when it fits the budget, else step down through JPEG
+   qualities, and only downscale as a last resort. */
+function fitEncode(cv, capBytes) {
+  let out = encodeCanvas(cv, 'image/png');
+  if (out.b64.length * 0.75 <= capBytes) return out;
+  for (const q of [0.92, 0.85, 0.75]) {
+    out = encodeCanvas(cv, 'image/jpeg', q);
+    if (out.b64.length * 0.75 <= capBytes) return out;
+  }
+  const cv2 = document.createElement('canvas');
+  cv2.width = Math.round(cv.width * 0.7); cv2.height = Math.round(cv.height * 0.7);
+  const c2 = cv2.getContext('2d'); c2.imageSmoothingQuality = 'high';
+  c2.drawImage(cv, 0, 0, cv2.width, cv2.height);
+  return encodeCanvas(cv2, 'image/jpeg', 0.8);
+}
+async function refit(im, capBytes) {
+  try {
+    const src = (im.preview && im.preview.startsWith('data:')) ? im.preview : 'data:image/png;base64,' + im.data;
+    const img = await loadImg(src);
+    const cv = document.createElement('canvas');
+    cv.width = img.width; cv.height = img.height;
+    cv.getContext('2d').drawImage(img, 0, 0);
+    const out = fitEncode(cv, capBytes);
+    return { data: out.b64, ext: out.mime === 'image/png' ? '.png' : '.jpg' };
+  } catch (e) { return im; }
 }
 
 function compressImage(file, maxDim = 1600, quality = 0.82, mime = 'image/jpeg') {
