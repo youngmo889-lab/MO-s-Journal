@@ -1558,6 +1558,13 @@ function renderAutofill() {
   wireAutofill();
 }
 window.afMethod = m => { S.af.method = m; S.af.drafts = null; S.af.status = ''; S.af.transcript = ''; renderAutofill(); };
+window.afRerun = () => {
+  const af = S.af;
+  if (!af.lastRun) return toast('⚠️ Nothing to re-run');
+  af.drafts = null; af.status = ''; af.transcript = '';
+  renderAutofill();
+  runAIParse(af.lastRun);
+};
 window.afBack = () => {
   if (S.af.drafts !== null) { S.af.drafts = null; renderAutofill(); }
   else if (S.af.method) { S.af.method = null; renderAutofill(); }
@@ -1652,6 +1659,16 @@ function afDraftsBody() {
         <span class="mono ${cls(d.pnl)}" style="font-weight:800">${d.pnl != null ? money(d.pnl) : '~' + money(d.pnlEstimated)}</span>
         ${d.dup ? '' : `<button class="btn btn-ghost" style="padding:6px 12px" onclick="afReview(${i})">✏️</button>`}
       </div>`).join('')}
+    ${(() => {
+      const lines = (af.transcript || '').split('\n').filter(l => l.trim().length > 3).length;
+      if (!lines || !af.drafts.length) return '';
+      const found = af.drafts.length;
+      return `<div class="af-status" style="margin:10px 0 0">
+        ${lines > found + 2
+          ? `⚠️ The AI read <b>${lines}</b> lines but produced <b>${found}</b> trade${found === 1 ? '' : 's'}. If your statement shows more, expand 🔍 below — if rows are missing there, crop tighter and re-run.`
+          : `✅ ${found} trade${found === 1 ? '' : 's'} extracted from ${lines} lines read.`}
+        <button class="btn btn-ghost" style="padding:4px 10px;margin-left:8px" onclick="afRerun()">🔄 Re-run</button></div>`;
+    })()}
     ${af.transcript ? `<details class="af-ocr" style="margin-top:14px"><summary>🔍 What the AI actually read — check it before importing</summary>
       <pre class="af-ocr-pre">${esc(af.transcript)}</pre>
       <div style="font-size:11px;color:var(--muted);margin-top:6px">If these numbers differ from your screenshot, ✏️ edit the trade below — or crop the shot tighter and re-run.</div></details>` : ''}
@@ -1772,13 +1789,29 @@ function rawTradeSame(a, b) {
   if (da !== db) return false;
   const ea = num(a.entry ?? a.openPrice ?? a.open), eb = num(b.entry ?? b.openPrice ?? b.open);
   if (ea != null && eb != null && Math.abs(ea - eb) > Math.max(1e-9, Math.abs(ea) * 0.002)) return false;
+  // v4.6.12 FIX: the old line ended `return ta === tb || !ta || !tb;` — so whenever the AI
+  // could not read an open time, ANY two trades on the same pair were declared identical and
+  // the second was silently discarded (2 trades in the history, 1 in the journal).
+  // Now we only merge when we can PROVE they are the same; otherwise keep both — a visible
+  // duplicate is annoying, a swallowed trade corrupts the stats.
   const ta = String(a.openTime || a.date || a.time || '');
   const tb = String(b.openTime || b.date || b.time || '');
-  return ta === tb || !ta || !tb;
+  if (ta && tb) return ta === tb;
+  const at = String(a.ticket ?? a.order ?? a.position ?? '');
+  const bt = String(b.ticket ?? b.order ?? b.position ?? '');
+  if (at && bt && at === bt) return true;
+  const tol = Math.max(1e-9, Math.abs(ea || 0) * 0.002);
+  const xa = num(a.exit ?? a.closePrice ?? a.close);
+  const xb = num(b.exit ?? b.closePrice ?? b.close);
+  if (ea != null && eb != null && xa != null && xb != null) {
+    return Math.abs(ea - eb) <= tol && Math.abs(xa - xb) <= tol;
+  }
+  return false; // cannot prove they match → keep both
 }
 
 async function runAIParse({ images = [], text = '', attach = null }) {
   const af = S.af;
+  af.lastRun = { images, text, attach };  // v4.6.12: enables a one-tap re-run from the review screen
   const status = $('#afStatus'), go = $('#afGo');
   af.busy = true;
   if (go) { go.disabled = true; go.textContent = '🧠 AI is reading…'; }

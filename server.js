@@ -786,6 +786,8 @@ function missingShots() {
           + 'When two images show the SAME symbol and the SAME direction, MERGE them into ONE trade: take entry/sl/tp/openTime from the setup shot and exit/closeTime/pnl from the outcome shot. '
           + 'Only keep them separate if they are clearly different trades (different symbol, direction, or time).'
           + ' Also capture ticket/order number and any Comment column when present.'
+          + ' CRITICAL FOR DISTINCT TRADES: openTime and ticket are how separate trades are told apart. '
+          + 'Always fill openTime when any time column exists (use the date with 00:00 if only the date is shown) and always fill ticket when a Ticket/Order/Position column exists.'
           + 'SELF-CHECK before answering: every number you return MUST appear verbatim in the transcription above. '
           + 'If you cannot find a value written there, return null for it — never estimate, average or fill it in.'
       } else if (shotParts.length) {
