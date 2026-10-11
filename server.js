@@ -76,15 +76,20 @@ const maskAI = () => {
    reason about it in one step. So we split it: (1) pure OCR — transcribe the screenshot
    verbatim, digit for digit; (2) extract structured trades from that clean text. Reading
    then reasoning is dramatically more faithful than doing both at once. */
-const AI_OCR_PROMPT = `You are a precise OCR engine for trading screenshots. Transcribe EVERY line of visible text exactly as it appears, digit for digit.
-Rules:
-- Preserve row order and column order. Output one line per row.
-- Keep every decimal point exactly where it is. Do NOT round, convert, reformat or "clean" numbers.
-- Do not summarise, skip rows, merge rows, or add commentary.
-- Do not invent or guess any value. If a character is uncertain, write your best reading followed by ?.
-- Include headers, times, symbols, prices, volumes, profit/loss figures and any on-chart labels.
-- Separate columns with two spaces so prices stay distinguishable. Never merge two numbers into one.
-Output plain text only — no markdown, no explanation.`;
+const AI_OCR_PROMPT = `You are a precise OCR engine for trading screenshots. Your ONLY job is to copy what is on screen.
+
+IF THE SCREENSHOT SHOWS A TABLE OR TRADE HISTORY (MT4/MT5/any broker statement):
+1. Output the header row EXACTLY as shown, with columns separated by a TAB character.
+2. Then output one row per trade, values separated by TABs, in the SAME column order.
+3. Keep repeated headers exactly as they appear — an MT5 statement has TWO "Time" columns and TWO "Price" columns. Do NOT rename or merge them; position is what tells them apart.
+4. Copy every number digit for digit. Never round, reformat, recalculate or "clean" anything.
+5. Do not skip, merge or reorder rows. Do not add commentary.
+6. If a value is unclear, write your best reading followed by ?.
+
+IF THE SCREENSHOT IS A CHART (no table):
+Transcribe every visible text label, price level and on-chart annotation line by line, digit for digit, in reading order.
+
+Never invent a value. Output the table or the text only — no explanation.`;
 
 const AI_EXTRACT_PROMPT = `You are the extraction engine of a trading journal. Read the broker screenshot(s)/history and return ONLY a JSON object (no markdown, no prose):
 {"trades":[{"pair":"Volatility 75","dir":"long","lots":1,"entry":6350.2,"exit":6358.7,"sl":6345.2,"tp":6360.2,"openTime":"2026-09-19 09:14","closeTime":"2026-09-19 15:40","pnl":8.5,"setup":"Break & retest","broker":"Weltrade","ticket":"51829374","comment":""}]}
@@ -782,6 +787,11 @@ function missingShots() {
           + 'Do NOT round, convert, recalculate or "correct" any value. Use null for anything absent. '
           + 'If the transcription contains no trade data, return {"trades":[]}. Do not invent trades.'
           + ' COMPLETENESS: extract EVERY trade row visible in the transcription — do not stop after a few, do not summarise, do not merge separate rows.'
+          + ' MT4/MT5 COLUMN MEANINGS (the columns repeat — position decides which is which): '
+          + 'Time #1 = open time · Time #2 = close time · Price #1 = entry/open price · Price #2 = exit/close price. '
+          + 'Symbol = pair · Type = buy/sell · Volume = lot size · S/L = stop loss · T/P = take profit · Profit = the P&L. '
+          + 'Commission and Swap are FEES, not P&L — never add or subtract them from Profit, and never use them as prices. '
+          + 'If a value sits in a column you cannot identify, use null rather than guessing.'
           + ' BEFORE / AFTER SETS: these screenshots are often one batch showing the same trade at different moments — a setup shot (entry, SL, TP, the plan) and an outcome shot (exit, result, P&L). '
           + 'When two images show the SAME symbol and the SAME direction, MERGE them into ONE trade: take entry/sl/tp/openTime from the setup shot and exit/closeTime/pnl from the outcome shot. '
           + 'Only keep them separate if they are clearly different trades (different symbol, direction, or time).'

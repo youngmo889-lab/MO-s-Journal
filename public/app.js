@@ -1660,6 +1660,17 @@ function afDraftsBody() {
         ${d.dup ? '' : `<button class="btn btn-ghost" style="padding:6px 12px" onclick="afReview(${i})">✏️</button>`}
       </div>`).join('')}
     ${(() => {
+      const tx = af.transcript || '';
+      // v4.6.14: the MT5 Trade tab shows OPEN positions — its Profit column is FLOATING and
+      // changes every tick. Logging that as a result silently corrupts the stats, so warn.
+      const looksOpen = /margin level|free margin/i.test(tx) && /equity/i.test(tx);
+      if (looksOpen) return `<div class="af-status" style="margin:0 0 12px;color:var(--gold)">
+        ⚠️ <b>This looks like the Trade tab — open positions.</b> The Profit column there is
+        <b>floating</b> (it moves every tick), not a final result. For exact closed numbers use
+        the <b>History</b> tab, or better: <b>📄 statement file → ReportHistory</b> (100% exact).</div>`;
+      return '';
+    })()}
+    ${(() => {
       const lines = (af.transcript || '').split('\n').filter(l => l.trim().length > 3).length;
       if (!lines || !af.drafts.length) return '';
       const found = af.drafts.length;
@@ -1706,7 +1717,7 @@ function wireAutofill() {
         for (const f of files) {
           status.innerHTML = `Reading <b>${esc(f.name)}</b>… ⚙️`;
           let text = '';
-          try { text = await f.text(); } catch { empties.push(f.name); continue; }
+          try { text = await readStatementFile(f); } catch { empties.push(f.name); continue; }
           let found = [];
           try { found = (window.MJParse ? MJParse.auto(text, f.name) : []) || []; }
           catch (pe) { console.warn('parse failed', f.name, pe); }
@@ -2268,6 +2279,21 @@ async function refit(im, capBytes) {
     const out = fitEncode(cv, capBytes);
     return { data: out.b64, ext: out.mime === 'image/png' ? '.png' : '.jpg' };
   } catch (e) { return im; }
+}
+
+/* v4.6.14: MT5 writes its HTML/CSV reports as UTF-16LE. Reading them as UTF-8 (what
+   file.text() does) yields interleaved NULs and the parser finds ZERO trades — which is why
+   the statement lane looked broken on real broker exports. Detect the encoding properly. */
+async function readStatementFile(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  if (buf[0] === 0xFF && buf[1] === 0xFE) return new TextDecoder('utf-16le').decode(buf).replace(/^\uFEFF/, '');
+  if (buf[0] === 0xFE && buf[1] === 0xFF) return new TextDecoder('utf-16be').decode(buf).replace(/^\uFEFF/, '');
+  if (buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) return new TextDecoder('utf-8').decode(buf.subarray(3));
+  // BOM-less UTF-16LE: every odd byte is zero for ASCII text
+  if (buf.length > 8 && buf[1] === 0 && buf[3] === 0 && buf[5] === 0 && buf[0] !== 0) {
+    try { return new TextDecoder('utf-16le').decode(buf).replace(/^\uFEFF/, ''); } catch (e) { /* fall through */ }
+  }
+  return new TextDecoder('utf-8').decode(buf);
 }
 
 function compressImage(file, maxDim = 1600, quality = 0.82, mime = 'image/jpeg') {

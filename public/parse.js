@@ -147,60 +147,91 @@
     const rows = htmlRows(text);
     if (!rows.length) return [];
     const drafts = [];
-    let map = null; // current header index map
-    for (const cells of rows) {
-      if (!cells.length) continue;
-      const low = cells.map(c => c.toLowerCase().replace(/\s+/g, ' ').trim());
-      // v4.6.0 ALIAS HEADER MAP: brokers disagree on words. MT5 says "Symbol/Volume",
-      // MT4 & Weltrade say "Item/Size", Deriv says "Contract". Accept them all — a missed
-      // alias used to silently map lots←ticket and entry←"2026.09". Never trust exact words.
+
+    // v4.6.14 header maps. MT5 statements contain SEVERAL tables (Positions, Orders, Deals).
+    // Only Positions = one row per closed trade with real P&L, so headers are scored and the
+    // best one wins — otherwise journal entries got built from pending/cancelled ORDERS.
+    const buildMap = low => {
       const has = re => low.findIndex(h => re.test(h));
-      const isHeader = has(/^(symbol|item|instrument|contract|asset)$/) >= 0
-        && (has(/^(profit|pnl|pl)$/) >= 0 || has(/^(volume|size|lots|amount)$/) >= 0);
-      if (isHeader) {
-        map = {};
-        const times = [], prices = [];
-        low.forEach((h, i) => {
-          if (/^(open time|close time|time|opened|closed|date)$/.test(h)) times.push(i);
-          if (/^(price|open price|close price|entry|exit)$/.test(h)) prices.push(i);
-        });
-        // positional times/prices: open comes first, close second (MT5 prints two of each)
-        map.pair = has(/^(symbol|item|instrument|contract|asset)$/);
-        map.dir  = has(/^(type|direction|side|action)$/);
-        map.lots = has(/^(volume|size|lots|amount|units)$/);
-        map.sl   = has(/^s ?\/ ?l$|^(stop loss|sl)$/);
-        map.tp   = has(/^t ?\/ ?p$|^(take profit|tp)$/);
-        map.pnl  = has(/^(profit|pnl|pl|net profit)$/);
-        map.date = times[0]; map.closedAt = times[1];
-        map.entry = prices[0]; map.exit = prices[1];
-        continue;
+      if (has(/^(symbol|item|instrument|contract|asset)$/) < 0) return null;
+      const m = {};
+      const times = [], prices = [];
+      low.forEach((h, i) => {
+        if (/^(open time|close time|time|opened|closed|date)$/.test(h)) times.push(i);
+        if (/^(price|open price|close price|entry|exit|market price)$/.test(h)) prices.push(i);
+      });
+      m.pair = has(/^(symbol|item|instrument|contract|asset)$/);
+      m.dir  = has(/^(type|direction|side|action)$/);
+      m.lots = has(/^(volume|size|lots|amount|units)$/);
+      m.sl   = has(/^s ?\/ ?l$|^(stop loss|sl)$/);
+      m.tp   = has(/^t ?\/ ?p$|^(take profit|tp)$/);
+      m.pnl  = has(/^(profit|pnl|pl|net profit)$/);
+      m.date = times[0]; m.closedAt = times[1];
+      m.entry = prices[0]; m.exit = prices[1];
+      // score: Positions (has "Position" + "Profit") beats Orders/Deals
+      let score = 0;
+      if (m.pnl >= 0) score += 4;
+      if (has(/^position$/) >= 0) score += 4;
+      if (m.lots >= 0) score += 2;
+      if (m.entry >= 0 && m.exit >= 0) score += 2;
+      if (has(/^(state|comment)$/) >= 0) score -= 5;   // Orders table
+      if (has(/^(deal|balance)$/) >= 0) score -= 3;    // Deals table
+      m.__score = score;
+      m.__len = low.length;
+      return score > 0 ? m : null;
+    };
+
+    // locate every header row
+    const headers = [];
+    rows.forEach((cells, idx) => {
+      const low = cells.map(c => String(c).toLowerCase().replace(/\s+/g, ' ').trim());
+      const m = buildMap(low);
+      if (m) headers.push({ idx, map: m });
+    });
+    if (!headers.length) return [];
+
+    const best = headers.slice().sort((a, b) => b.map.__score - a.map.__score)[0];
+    const nextHeaderIdx = headers.filter(h => h.idx > best.idx).map(h => h.idx)[0] ?? rows.length;
+    const map = best.map;
+
+    // v4.6.14 ALIGNMENT: MT5 emits a hidden empty <td> after "Type", so data rows carry ONE
+    // MORE cell than the header. Every column then shifts by one — volume read as the ticket,
+    // SL read as the entry price, and so on. Drop the spacers to line the row up again.
+    const align = cells => {
+      let c = cells.slice();
+      let guard = 0;
+      while (c.length > map.__len && guard++ < 6) {
+        const i = c.findIndex((v, k) => k > 0 && String(v).trim() === '');
+        if (i < 0) break;
+        c.splice(i, 1);
       }
-      // MT5/MT4 data row (has mapped header)
-      if (map && map.dir >= 0 && cells.length >= 6 && /buy|sell|long|short/i.test(cells[map.dir] || '')) {
-        const d = normalize({
-          pair: cells[map.pair], dir: cells[map.dir], lots: cells[map.lots],
-          entry: cells[map.entry], exit: cells[map.exit],
-          sl: cells[map.sl], tp: cells[map.tp],
-          date: cells[map.date], closedAt: cells[map.closedAt], pnl: cells[map.pnl],
-        });
-        if (d) drafts.push(d);
-        continue;
-      }
-      // MT4 detailed statement row: [ticket, openTime, type, size, item, openPrice, sl, tp, closeTime, closePrice, comm..., profit]
-      if (cells.length >= 13 && /buy|sell/i.test(cells[2] || '') && /\d{4}[./-]\d{2}[./-]\d{2}/.test(cells[1] || '')) {
-        const d = normalize({
-          pair: cells[4], dir: cells[2], lots: cells[3],
-          entry: cells[5], sl: cells[6], tp: cells[7],
-          date: cells[1], closedAt: cells[8], exit: cells[9],
-          pnl: cells[cells.length - 1],
-        });
-        if (d) drafts.push(d);
-      }
+      return c;
+    };
+
+    for (let r = best.idx + 1; r < nextHeaderIdx; r++) {
+      const raw = rows[r];
+      if (!raw) continue;
+      // v4.6.14: a table ends when the next SECTION TITLE appears ("Orders", "Deals", ...).
+      // Those one-cell titles are the only reliable boundary — Orders/Deals headers score too
+      // low to register, and without this their rows leaked in as phantom trades.
+      const words = raw.filter(c => String(c).trim()).join(' ');
+      if (raw.length <= 2 && /^(positions|orders|deals|trades|summary|settings|report)/i.test(words)) break;
+      if (raw.length < 5) continue;                          // spacer
+      const cells = align(raw);
+      // a row from a different table won't have this table's column count
+      if (cells.length < map.__len || cells.length > map.__len + 1) continue;
+      if (!/buy|sell|long|short/i.test(String(cells[map.dir] || ''))) continue;
+      const d = normalize({
+        pair: cells[map.pair], dir: cells[map.dir], lots: cells[map.lots],
+        entry: cells[map.entry], exit: cells[map.exit],
+        sl: cells[map.sl], tp: cells[map.tp],
+        date: cells[map.date], closedAt: cells[map.closedAt], pnl: cells[map.pnl],
+      });
+      if (d) drafts.push(d);
     }
     return drafts;
   }
 
-  /* -------- loose pasted lines (fallback when no AI key) -------- */
   function parseLoose(text) {
     const drafts = [];
     text.split(/\r?\n/).forEach(line => {
