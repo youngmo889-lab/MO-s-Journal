@@ -1558,6 +1558,36 @@ function renderAutofill() {
   wireAutofill();
 }
 window.afMethod = m => { S.af.method = m; S.af.drafts = null; S.af.status = ''; S.af.transcript = ''; renderAutofill(); };
+/* v4.6.15 HYBRID IMPORT: pull the exact numbers from the broker report, then pin the
+   before/after chart shots onto those trades — evidence without a single guessed digit. */
+async function shotsFromFiles(fileList) {
+  const shots = [];
+  for (const f of fileList) {
+    try {
+      const data = await compressImage(f, 1600, 0.9);            // JPEG: legible + vaultable
+      shots.push({ data, ext: '.jpg', preview: 'data:image/jpeg;base64,' + data });
+    } catch (e) { /* skip unreadable file */ }
+  }
+  return shots;
+}
+window.afAttachAll = async ev => {
+  const shots = await shotsFromFiles([...(ev.target.files || [])]); ev.target.value = '';
+  if (!shots.length) return toast('⚠️ No images read');
+  const af = S.af;
+  af.drafts.forEach(d => { if (!d.dup) d._shots = [...(d._shots || []), ...shots]; });
+  renderAutofill();
+  toast(`📎 ${shots.length} shot${shots.length > 1 ? 's' : ''} attached to ${af.drafts.filter(d => !d.dup).length} trades`, 'gold');
+};
+window.afAttachOne = async (ev, i) => {
+  const shots = await shotsFromFiles([...(ev.target.files || [])]); ev.target.value = '';
+  if (!shots.length) return toast('⚠️ No images read');
+  const d = S.af.drafts[i];
+  d._shots = [...(d._shots || []), ...shots];
+  renderAutofill();
+  toast(`📎 ${shots.length} shot${shots.length > 1 ? 's' : ''} attached to this trade`, 'gold');
+};
+window.afRemoveShot = (i, k) => { S.af.drafts[i]._shots.splice(k, 1); renderAutofill(); };
+
 window.afRerun = () => {
   const af = S.af;
   if (!af.lastRun) return toast('⚠️ Nothing to re-run');
@@ -1648,6 +1678,11 @@ function afDraftsBody() {
   return `
     <div class="af-status" style="margin:0 0 12px"><b>${af.drafts.filter(d => !d.dup).length} new trades</b> found${af.drafts.some(d => d.dup) ? ` · ${af.drafts.filter(d => d.dup).length} already logged (skipped)` : ''}${af.via ? ` <span style="color:var(--muted)">· 🧠 answered by ${esc(af.via.split('/').pop())}</span>` : ''}.
       Review each one, or bulk-import:${af.images.length ? ` <span style="color:var(--muted)">📎 your ${af.images.length} shot${af.images.length > 1 ? 's' : ''} attach to each trade — shared setup, shared evidence (✕ any wrong ones in review)</span>` : ''}</div>
+    <div class="af-attach-bar">
+      <label class="btn btn-gold" style="margin:0">📎 Attach chart shots to ALL these trades
+        <input type="file" accept="image/*" multiple class="hidden" onchange="afAttachAll(event)"></label>
+      <span style="font-size:11px;color:var(--muted)">Exact numbers came from your report — these are the pictures that go with them.</span>
+    </div>
     ${af.drafts.map((d, i) => `
       <div class="draft-row ${d.dup ? 'dup' : ''}">
         <span style="font-size:20px">${d.dir === 'long' ? '🟢' : '🔴'}</span>
@@ -1655,6 +1690,10 @@ function afDraftsBody() {
           <div class="dr-title">${esc(d.pair)} · ${d.dir === 'long' ? 'Buy' : 'Sell'} ${d.lots ?? '—'} lot</div>
           <div class="dr-sub">${d.entry ?? '?'} → ${d.exit ?? '?'} ${d.date ? '· ' + fmtDate(d.date) : ''}${d.closedAt ? ' · held ' + (holdFmt(new Date(d.closedAt) - new Date(d.date)) || '?') : ''}${d.setup ? ' · ⚡ ' + esc(d.setup) : ''}</div>
           ${d.dup ? '<div class="dr-sub" style="color:var(--gold)">already in your journal — skip</div>' : ''}
+          ${(d._shots || []).length ? `<div class="af-shot-strip">${d._shots.map((sh, k) => `
+            <span class="af-shot"><img src="${sh.preview}" alt=""><button onclick="afRemoveShot(${i},${k})">✕</button></span>`).join('')}</div>` : ''}
+          ${d.dup ? '' : `<label class="btn btn-ghost" style="padding:4px 8px;margin-top:6px;font-size:11px">📎 this trade only
+            <input type="file" accept="image/*" multiple class="hidden" onchange="afAttachOne(event, ${i})"></label>`}
         </div>
         <span class="mono ${cls(d.pnl)}" style="font-weight:800">${d.pnl != null ? money(d.pnl) : '~' + money(d.pnlEstimated)}</span>
         ${d.dup ? '' : `<button class="btn btn-ghost" style="padding:6px 12px" onclick="afReview(${i})">✏️</button>`}
@@ -1727,7 +1766,7 @@ function wireAutofill() {
         }
         af.drafts = markDups(all);
         af.status = all.length
-          ? `📄 ${names.join(' · ')} — merged.`
+          ? `📄 ${names.join(' · ')} — merged. Next: attach your before/after chart shots below.`
           : `I read ${files.length} file${files.length > 1 ? 's' : ''} but found no trade rows. For MT5, use Toolbox → History → right-click → Report (HTML or CSV), and make sure the Positions table is in it.`;
         renderAutofill();
       };

@@ -460,3 +460,12 @@ input, select, textarea { font: inherit; }
   font-size: 11px; line-height: 1.45; padding: 10px; margin-top: 6px;
   background: rgba(0,0,0,.35); border: 1px solid var(--border); border-radius: 8px;
 }
+
+/* v4.6.15 hybrid import — attach chart shots to parsed trades */
+.af-attach-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0 4px; }
+.af-attach-bar .btn { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.af-shot-strip { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.af-shot { position: relative; display: inline-block; }
+.af-shot img { width: 46px; height: 46px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); }
+.af-shot button { position: absolute; top: -6px; right: -6px; background: #c0392b; color: #fff; border: 0;
+  border-radius: 50%; width: 18px; height: 18px; font-size: 11px; line-height: 1; cursor: pointer; }
