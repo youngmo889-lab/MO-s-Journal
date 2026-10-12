@@ -549,6 +549,7 @@ function renderDashboard(v, g, t) {
       ${stat('Account equity', money(round2(eq), false), '', 'Started ' + money(bal, false))}
     </div>
     ${accountsCard()}
+    ${reviewQueueCard(t)}
     ${planCard(v, true)}
     <div class="card mt">
       <div class="card-title">📈 Equity curve <span class="sub">${viewLabel()} · max DD <span class="neg">${money(-v.maxDD, false)}</span></span></div>
@@ -782,7 +783,8 @@ function renderJournal(t) {
   el.innerHTML = `
     <div class="row-between mb" style="flex-wrap:wrap">
       <div class="page-title" style="margin:0">Journal <small>${t.length} trades · ${viewLabel()}</small></div>
-      <div style="display:flex;gap:8px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        ${needsReview(t).length ? `<button class="btn btn-gold" onclick="openReviewQueue()">🧠 Review ${needsReview(t).length}</button>` : ''}
         <button class="btn btn-ghost" onclick="openAutofill()">🪄 Auto-fill</button>
         <button class="btn btn-primary" onclick="openTradeForm()">＋ Log trade</button>
       </div>
@@ -1157,6 +1159,7 @@ function renderSettings() {
         Your journal (all accounts) lives on this server — same link on PC and phone. <b>Tip:</b> "Add to Home Screen" on your phone for an app icon. 📲
       </div>
       <div id="backupStatus" class="af-status" style="margin:0 0 10px">Checking backup status…</div>
+      <div id="vaultHealth" class="vault-meter"><span style="color:var(--muted)">🗄️ Measuring vault capacity…</span></div>
       <div class="chips">
         <button class="btn btn-gold" onclick="backupNow()">☁️ Backup now</button>
         <button class="btn" onclick="checkShots()">🔎 Check screenshots</button>
@@ -1187,6 +1190,7 @@ function renderSettings() {
     if (f) f.textContent = m.gistSync ? '☁️ cloud backup: ON (GitHub Gist)' : '💾 local disk backup (export regularly!)';
     renderBackupStatus(m);
   }).catch(() => {});
+  renderVaultHealth();
   $$('#aiPresetChips .chip-toggle').forEach(b => b.onclick = () => {
     $$('#aiPresetChips .chip-toggle').forEach(x => x.classList.remove('on'));
     b.classList.add('on');
@@ -1260,6 +1264,29 @@ function renderBackupStatus(m) {
     <span style="color:var(--muted)">Last snapshot: <b>${lb ? ago(lb.at) : 'none yet'}</b>${lb ? ` (${lb.trades} trades)` : ''} · auto-syncs ~8s after every change
     ${m.gistUrl ? ` · <a href="${esc(m.gistUrl)}" target="_blank" style="color:var(--gold)">open vault ↗</a>` : ''}</span>`;
 }
+/* v4.6.17 VAULT HEALTH METER — GitHub stops listing gist files past ~300 entries, and every
+   screenshot costs one file. Invisible ceiling, so make it visible: how full the vault is,
+   how much room is left, and which shots are referenced by trades but never made it in. */
+async function renderVaultHealth() {
+  const el = $('#vaultHealth'); if (!el) return;
+  let h;
+  try { h = await api('/api/vault/health'); } catch { el.innerHTML = ''; return; }
+  if (!h.enabled) { el.innerHTML = '<span style="color:var(--muted)">🗄️ Vault capacity — cloud backup is off, nothing to measure.</span>'; return; }
+  const mb = h.bytes ? (h.bytes / 1e6).toFixed(1) + ' MB' : '—';
+  const tone = h.critical ? 'crit' : h.warn ? 'warn' : 'ok';
+  const room = Math.max(0, h.limit - h.files);
+  const note = h.critical
+    ? `🚨 <b>Vault full.</b> GitHub stops listing files past ${h.limit}, so newer screenshots can stop coming back. Recovery now reads from the manifest (not the listing), but it's time to prune old shots.`
+    : h.warn
+      ? `⚠️ <b>Getting full — ${room} slots left.</b> Past ${h.limit} files GitHub truncates the file list.`
+      : `✅ Plenty of room — about <b>${room}</b> more screenshots fit.`;
+  el.innerHTML = `
+    <div class="vm-head"><b>🗄️ Vault capacity</b>
+      <span class="mono">${h.files} / ${h.limit} files · ${mb}${h.onDisk != null ? ` · ${h.onDisk} on disk` : ''}</span></div>
+    <div class="vm-track"><span class="vm-fill ${tone}" style="width:${Math.max(2, h.pct)}%"></span></div>
+    <div class="vm-note ${tone}">${note}</div>
+    ${h.atRisk && h.atRisk.length ? `<div class="vm-note crit">🚨 <b>${h.atRisk.length} screenshot${h.atRisk.length === 1 ? '' : 's'}</b> referenced by trades but <b>not in the vault</b> — hit <b>☁️ Backup now</b> or they're gone on the next redeploy.</div>` : ''}`;
+}
 window.openTimeMachine = async () => {
   const out = $('#tmOut'); if (out) out.innerHTML = '⏳ Reading vault history…';
   let r;
@@ -1316,6 +1343,7 @@ window.backupNow = async () => {
     const r = await api('/api/backup', 'POST');
     const m = await api('/api/meta');
     renderBackupStatus(m);
+    renderVaultHealth();
     toast(`☁️ Backed up — ${r.trades} trades, ${r.shots} screenshots`, 'gold');
   } catch (e) {
     if (el) el.innerHTML = `<span class="neg">✗ Backup failed: ${esc(e.message)}</span>`;
@@ -1512,7 +1540,8 @@ const AF_MAX_SHOTS = 12;   // AUTO-FILL batch ceiling — parsed in rounds of 4 
 const AF_BATCH = 8;   // v4.6.11: before/after shots only make sense together — send the SET, not pairs
 
 window.openAutofill = () => {
-  S.af = { method: null, images: [], text: '', hint: '', drafts: null, busy: false, status: '', via: '' };
+  S.af = { method: null, images: [], text: '', hint: '', drafts: null, busy: false, status: '', via: '',
+    bulk: { setup: '', rules: {} } };   // v4.6.17: tag the whole batch in one tap
   renderAutofill();
 };
 
@@ -1587,6 +1616,64 @@ window.afAttachOne = async (ev, i) => {
   toast(`📎 ${shots.length} shot${shots.length > 1 ? 's' : ''} attached to this trade`, 'gold');
 };
 window.afRemoveShot = (i, k) => { S.af.drafts[i]._shots.splice(k, 1); renderAutofill(); };
+/* v4.6.17 BATCH TAGGING — a broker report gives perfect NUMBERS but zero CONTEXT. Tagging
+   setup + rules per-trade by hand is why the psychology panels stayed empty: 12 imports a
+   week × 8 taps each never survives real life. One screen, one tap, whole batch. */
+function afBulkBar() {
+  const af = S.af;
+  const fresh = af.drafts.filter(d => !d.dup);
+  if (!fresh.length) return '';
+  const b = af.bulk || (af.bulk = { setup: '', rules: {} });
+  const rules = S.settings.rules || [];
+  const setups = [...new Set([...SETUP_IDEAS, ...S.trades.map(x => x.setup).filter(Boolean)])];
+  const src = fresh.find(d => (d._shots || []).length);
+  const bare = fresh.filter(d => !(d._shots || []).length).length;
+  return `<div class="af-bulk">
+    <div class="ab-title">🏷️ Tag the whole batch <span>applies to all ${fresh.length} trade${fresh.length === 1 ? '' : 's'} at once</span></div>
+    <div class="ab-row">
+      <input id="afBulkSetup" list="afBulkSetups" placeholder="Setup name… e.g. Quasimodo" value="${esc(b.setup)}" oninput="S.af.bulk.setup=this.value">
+      <datalist id="afBulkSetups">${setups.map(s => `<option>${esc(s)}</option>`).join('')}</datalist>
+      <button class="btn btn-gold" onclick="afBulkApply()">Apply →</button>
+    </div>
+    ${rules.length ? `<div class="ab-rules">
+      ${rules.map((r, i) => `<button type="button" class="chip-toggle ${b.rules[r] ? 'on' : ''}" onclick="afBulkRule(${i})">${b.rules[r] ? '✅' : '⬜'} ${esc(r)}</button>`).join('')}
+    </div>` : `<div class="ab-hint">No rules set yet — add them in ⚙️ Settings → 📜 My trading rules, then this becomes one tap.</div>`}
+    <div class="ab-hint">Tick the rules you followed, name the setup, hit Apply. Setup feeds the 🧪 Setup Lab; rules feed your discipline score. You can still ✏️ any single trade after.</div>
+    ${src && bare ? `<div class="ab-row" style="margin-top:8px">
+      <span class="ab-hint" style="flex:1;margin:0">📎 ${src._shots.length} chart shot${src._shots.length === 1 ? '' : 's'} attached to one trade — ${bare} other${bare === 1 ? '' : 's'} have none.</span>
+      <button class="btn" onclick="afCopyShotsToAll()">Copy to all →</button></div>` : ''}
+  </div>`;
+}
+window.afBulkRule = i => {
+  const r = (S.settings.rules || [])[i]; if (r == null) return;
+  const b = S.af.bulk || (S.af.bulk = { setup: '', rules: {} });
+  if (b.rules[r]) delete b.rules[r]; else b.rules[r] = true;
+  renderAutofill();
+};
+window.afBulkApply = () => {
+  const af = S.af, b = af.bulk || {};
+  const setup = (b.setup || '').trim();
+  const rules = { ...(b.rules || {}) };
+  if (!setup && !Object.keys(rules).length) return toast('⚠️ Name a setup or tick a rule first');
+  let n = 0;
+  af.drafts.forEach(d => {
+    if (d.dup) return;
+    if (setup) d.setup = setup;
+    if (Object.keys(rules).length) d._rules = { ...rules };
+    n++;
+  });
+  renderAutofill();
+  toast(`🏷️ Tagged ${n} trade${n === 1 ? '' : 's'}${setup ? ' · ' + setup : ''}`, 'gold');
+};
+window.afCopyShotsToAll = () => {
+  const af = S.af;
+  const src = af.drafts.find(d => !d.dup && (d._shots || []).length);
+  if (!src) return toast('⚠️ Attach the shots to one trade first');
+  let n = 0;
+  af.drafts.forEach(d => { if (d.dup || d === src) return; d._shots = [...src._shots]; n++; });
+  renderAutofill();
+  toast(`📎 Copied ${src._shots.length} shot${src._shots.length === 1 ? '' : 's'} to ${n} more trade${n === 1 ? '' : 's'}`, 'gold');
+};
 
 window.afRerun = () => {
   const af = S.af;
@@ -1683,6 +1770,7 @@ function afDraftsBody() {
         <input type="file" accept="image/*" multiple class="hidden" onchange="afAttachAll(event)"></label>
       <span style="font-size:11px;color:var(--muted)">Exact numbers came from your report — these are the pictures that go with them.</span>
     </div>
+    ${afBulkBar()}
     ${af.drafts.map((d, i) => `
       <div class="draft-row ${d.dup ? 'dup' : ''}">
         <span style="font-size:20px">${d.dir === 'long' ? '🟢' : '🔴'}</span>
@@ -2028,7 +2116,7 @@ window.afImportAll = async () => {
       pnl: d.pnl, pnlOverridden: d.pnl != null && d.pnl !== d.pnlEstimated,
       riskAmount: d.riskAmount, rMultiple: d.rMultiple, rrPlanned: d.rrPlanned,
       session: blockFromHour(date.getHours()), setup: d.setup || '',
-      rules: {}, mistakes: [], lesson: '',
+      rules: d._rules || {}, mistakes: [], lesson: '',
       notes: [d.ticket ? 'Ticket ' + d.ticket : '', d.comment || ''].filter(Boolean).join(' · '),
       screenshots: [],
       wave: d.wave || null, waveRole: d.waveRole || null,
@@ -2045,6 +2133,128 @@ window.afImportAll = async () => {
   toast(`🪄 ${done} trades AUTO-FILLED!${shotsAttached ? ` 📎 ${shotsAttached} screenshots attached` : ''}`, 'gold'); confettiBurst();
   go('journal');
 };
+
+/* ---------------- v4.6.17 REVIEW QUEUE ----------------
+   The journal's psychology engine only runs on rules / mistakes / lessons — and those are
+   exactly the fields nobody fills in at 11pm after a session. So instead of asking for a
+   form per trade, walk the unfilled ones one at a time: tap, tap, done. */
+const RQ = { list: [], i: 0, saved: 0 };
+function needsReview(list) {
+  return (list || []).filter(t => !t.running
+    && !(t.lesson || '').trim()
+    && !(t.mistakes || []).length
+    && !Object.values(t.rules || {}).some(Boolean))
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+}
+window.openReviewQueue = () => {
+  RQ.list = needsReview(viewTrades()); RQ.i = 0; RQ.saved = 0;
+  if (!RQ.list.length) { toast('✅ Every trade here is already reviewed 🎉'); return; }
+  renderReviewQueue();
+};
+function renderReviewQueue() {
+  const rules = S.settings.rules || [];
+  if (RQ.i >= RQ.list.length) {
+    $('#modalRoot').innerHTML = `<div class="modal-overlay"><div class="modal-sheet">
+      <div class="modal-head"><div class="modal-title">🧠 Review done</div>
+        <button class="modal-close" onclick="closeModal()">✕</button></div>
+      <div class="empty"><div class="big">🎉</div><b>${RQ.saved} trade${RQ.saved === 1 ? '' : 's'} reviewed.</b><br><br>
+        Your discipline score, mistake patterns and lesson log just got real data — the
+        🪞 Mirror and 🧪 Setup Lab read straight from it.</div>
+      <button class="btn btn-primary btn-block mt" onclick="closeModal();go('analytics')">📊 Show me what it says</button>
+      <button class="btn btn-block mt" onclick="closeModal()">Done</button>
+    </div></div>`;
+    return;
+  }
+  const t = RQ.list[RQ.i];
+  const chip = (list, group) => list.map(([val, lbl]) =>
+    `<button type="button" class="chip-toggle" data-group="${group}" data-val="${esc(val)}">${lbl}</button>`).join('');
+  const suggested = t.setup || suggestSetup(t.pair);
+  const pct = Math.round((RQ.i / RQ.list.length) * 100);
+  $('#modalRoot').innerHTML = `<div class="modal-overlay"><div class="modal-sheet">
+    <div class="modal-head">
+      <div class="modal-title">🧠 Quick review <small>${RQ.i + 1} of ${RQ.list.length}</small></div>
+      <button class="modal-close" onclick="rqFinish()">✕</button>
+    </div>
+    <div class="rq-bar"><span style="width:${pct}%"></span></div>
+    <div class="rq-trade">
+      <span style="font-size:22px">${t.dir === 'long' ? '🟢' : '🔴'}</span>
+      <div style="flex:1">
+        <div style="font-weight:800">${esc(t.pair)} · ${t.dir === 'long' ? 'Buy' : 'Sell'} ${t.lots ?? '—'} lot</div>
+        <div style="font-size:11px;color:var(--muted)">${fmtDate(t.date)} · ${t.entry ?? '?'} → ${t.exit ?? '?'}${t.rMultiple != null ? ' · ' + round2(t.rMultiple) + 'R' : ''}</div>
+      </div>
+      <span class="mono ${cls(t.pnl)}" style="font-weight:800">${money(t.pnl)}</span>
+    </div>
+    <div class="sec-label">⚡ Setup</div>
+    <input id="rqSetup" list="rqSetups" placeholder="Quasimodo…" value="${esc(suggested)}" style="width:100%;margin-bottom:10px">
+    <datalist id="rqSetups">${[...new Set([...SETUP_IDEAS, ...S.trades.map(x => x.setup).filter(Boolean)])].map(s => `<option>${esc(s)}</option>`).join('')}</datalist>
+    <div class="sec-label">📜 Rules — untick what you broke</div>
+    <div id="rqRules">${rules.length ? rules.map(r => `
+      <div class="rule-row ok"><span class="tick">✅</span><span style="flex:1">${esc(r)}</span></div>`).join('')
+      : '<div class="hint" style="color:var(--muted)">No rules yet — add them in ⚙️ Settings → 📜 My trading rules.</div>'}</div>
+    <div class="sec-label">⚠️ Mistakes</div>
+    <div class="chips" id="rqMistakes">${MISTAKES.map(m => `<button type="button" class="chip-toggle" data-mistake="${esc(m)}">${esc(m)}</button>`).join('')}</div>
+    <div class="sec-label">🎭 Feelings <span style="color:var(--muted);text-transform:none;font-weight:500">— optional</span></div>
+    <div class="chips" id="rqEmoB" style="margin-bottom:6px">${chip(EMOTIONS_BEFORE, 'rqB')}</div>
+    <div class="chips" id="rqEmoA">${chip(EMOTIONS_AFTER, 'rqA')}</div>
+    <div class="sec-label">📚 Lesson <span style="color:var(--muted);text-transform:none;font-weight:500">— +${XP_LESSON} XP</span></div>
+    <textarea id="rqLesson" rows="3" placeholder="One line is plenty — what did this trade teach you?"></textarea>
+    <div class="rq-actions">
+      <button class="btn" onclick="rqSkip()">⏭ Skip</button>
+      <button class="btn btn-primary" onclick="rqSave()">💾 Save &amp; next →</button>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-top:8px">You can always ✏️ edit the full trade later — this is the 10-second version.</div>
+  </div></div>`;
+  $$('#rqRules .rule-row').forEach(row => row.onclick = () => {
+    const on = !row.classList.contains('ok');
+    row.classList.toggle('ok', on);
+    row.querySelector('.tick').textContent = on ? '✅' : '⬜';
+  });
+  $$('#rqMistakes .chip-toggle').forEach(b => b.onclick = () => b.classList.toggle('on-neg'));
+  $$('#rqEmoB .chip-toggle, #rqEmoA .chip-toggle').forEach(b => b.onclick = () => {
+    const g = b.dataset.group;
+    $$(`#${g === 'rqB' ? 'rqEmoB' : 'rqEmoA'} .chip-toggle`).forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+  });
+}
+window.rqSkip = () => { RQ.i++; renderReviewQueue(); };
+window.rqSave = async () => {
+  const t = RQ.list[RQ.i]; if (!t) return;
+  const rules = {};
+  $$('#rqRules .rule-row').forEach((row, i) => {
+    const r = (S.settings.rules || [])[i];
+    if (r) rules[r] = row.classList.contains('ok');
+  });
+  const mistakes = $$('#rqMistakes .chip-toggle.on-neg').map(b => b.dataset.mistake);
+  const one = sel => { const b = $$(sel + ' .chip-toggle.on')[0]; return b ? b.dataset.val : ''; };
+  const upd = {
+    setup: (($('#rqSetup') || {}).value || '').trim(),
+    rules, mistakes,
+    lesson: (($('#rqLesson') || {}).value || '').trim(),
+    emotionBefore: one('#rqEmoB'), emotionAfter: one('#rqEmoA'),
+  };
+  try {
+    await api('/api/trade/' + t.id, 'POST', upd);
+    Object.assign(t, upd);          // keep the local copy honest so the queue doesn't re-list it
+    RQ.saved++; RQ.i++; renderReviewQueue();
+    if (RQ.i >= RQ.list.length) { await loadState(); renderAll(); }
+  } catch (e) { toast('⚠️ Could not save — ' + e.message); }
+};
+window.rqFinish = async () => {
+  if (RQ.saved) { await loadState(); renderAll(); }
+  closeModal();
+};
+function reviewQueueCard(t) {
+  const n = needsReview(t).length;
+  if (!n) return '';
+  return `<div class="card rq-nudge">
+    <div class="card-title">🧠 ${n} trade${n === 1 ? '' : 's'} waiting for a quick review <span class="sub">rules · mistakes · lesson</span></div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:12px">
+      The numbers are logged, but these have no <b>rules ticked, no lesson, no mistakes</b> — so your
+      discipline score and 🪞 Mirror have nothing to read. One screen, one trade at a time, ~10 seconds each.
+    </div>
+    <button class="btn btn-primary btn-block" onclick="openReviewQueue()">🧠 Start reviewing →</button>
+  </div>`;
+}
 
 /* ---------------- Trade form ---------------- */
 function waveDatalist() {

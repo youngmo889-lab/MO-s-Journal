@@ -469,3 +469,52 @@ input, select, textarea { font: inherit; }
 .af-shot img { width: 46px; height: 46px; object-fit: cover; border-radius: 8px; border: 1px solid var(--border); }
 .af-shot button { position: absolute; top: -6px; right: -6px; background: #c0392b; color: #fff; border: 0;
   border-radius: 50%; width: 18px; height: 18px; font-size: 11px; line-height: 1; cursor: pointer; }
+
+/* ── v4.6.17 · BATCH TAGGING (AUTO-FILL review screen) ───────────────────── */
+.af-bulk {
+  background: linear-gradient(135deg, rgba(240,185,11,.09), rgba(240,185,11,.03));
+  border: 1px solid rgba(240,185,11,.35);
+  border-radius: 12px; padding: 12px; margin: 0 0 12px;
+}
+.af-bulk .ab-title {
+  font-weight: 800; font-size: 13px; margin-bottom: 10px;
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+}
+.af-bulk .ab-title span { font-weight: 500; font-size: 11px; color: var(--muted); }
+.af-bulk .ab-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.af-bulk .ab-row input {
+  flex: 1; min-width: 160px; background: var(--bg2, #14161c); color: var(--text, #fff);
+  border: 1px solid var(--line, #2a2f3a); border-radius: 8px; padding: 9px 10px; font-size: 13px;
+}
+.af-bulk .ab-rules { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.af-bulk .ab-hint { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+
+/* ── v4.6.17 · REVIEW QUEUE ──────────────────────────────────────────────── */
+.rq-nudge { border-color: rgba(240,185,11,.4); background: linear-gradient(135deg, rgba(240,185,11,.07), transparent); }
+.rq-bar { height: 5px; background: var(--line, #2a2f3a); border-radius: 99px; overflow: hidden; margin-bottom: 12px; }
+.rq-bar span { display: block; height: 100%; background: linear-gradient(90deg, var(--gold, #f0b90b), #ffd964); transition: width .25s; }
+.rq-trade {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+  background: var(--bg2, #14161c); border: 1px solid var(--line, #2a2f3a);
+  border-radius: 10px; margin-bottom: 12px;
+}
+.rq-actions { display: flex; gap: 8px; margin-top: 14px; }
+.rq-actions .btn { flex: 1; }
+#rqLesson, #rqSetup {
+  width: 100%; background: var(--bg2, #14161c); color: var(--text, #fff);
+  border: 1px solid var(--line, #2a2f3a); border-radius: 8px; padding: 9px 10px;
+  font-size: 13px; font-family: inherit;
+}
+
+/* ── v4.6.17 · VAULT HEALTH METER ────────────────────────────────────────── */
+.vault-meter { background: var(--bg2, #14161c); border: 1px solid var(--line, #2a2f3a); border-radius: 10px; padding: 10px 12px; margin: 0 0 12px; }
+.vault-meter .vm-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; font-size: 12px; margin-bottom: 8px; }
+.vault-meter .vm-head span { color: var(--muted); font-size: 11px; }
+.vault-meter .vm-track { height: 7px; background: rgba(255,255,255,.07); border-radius: 99px; overflow: hidden; }
+.vault-meter .vm-fill { display: block; height: 100%; border-radius: 99px; transition: width .3s; }
+.vault-meter .vm-fill.ok   { background: linear-gradient(90deg, #16c784, #4ade80); }
+.vault-meter .vm-fill.warn { background: linear-gradient(90deg, #f0b90b, #fbbf24); }
+.vault-meter .vm-fill.crit { background: linear-gradient(90deg, #ea3943, #ff6b6b); }
+.vault-meter .vm-note { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+.vault-meter .vm-note.warn { color: #fbbf24; }
+.vault-meter .vm-note.crit { color: #ff6b6b; }

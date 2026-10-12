@@ -157,37 +157,56 @@ function pendingShots() {
 }
 /* v4.6.10: GitHub TRUNCATES gist file content above ~1MB in the listing. The old code saw
    `truncated: true` and silently skipped those files — so every large screenshot sat safely
-   in the vault yet never came back, forever. Now we pull the raw URL to get the full bytes. */
-async function vaultRaw(fname) {
+   in the vault yet never came back, forever. Now we pull the raw URL to get the full bytes.
+   v4.6.17: EVERY vault read goes through gistRaw(). Two separate truncations bite here —
+   (a) file content >1MB, (b) the FILES LIST >300 entries. Raw URLs are immune to both, so
+   the only safe way to read out of the vault is by raw file URL. */
+function gistRawUrl(fname) {
   const owner = (gist.url || '').split('/')[3] || '';
   if (!owner || !gist.id) return null;
+  return `https://gist.githubusercontent.com/${owner}/${gist.id}/raw/${fname}`;
+}
+async function gistRaw(fname, timeoutMs = 45000) {
+  const url = gistRawUrl(fname);
+  if (!url || !GIST_TOKEN) return null;
   try {
-    const r = await fetch(`https://gist.githubusercontent.com/${owner}/${gist.id}/raw/${fname}`, {
+    const r = await fetch(url, {
       headers: { Authorization: 'Bearer ' + GIST_TOKEN, 'User-Agent': "Mo's Journal" },
-      signal: AbortSignal.timeout(45000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     if (!r.ok) return null;
     return await r.text();
   } catch (e) { return null; }
 }
+const vaultRaw = fname => gistRaw(fname);
 
 async function decodeVaultShots(files) {
   const vaulted = new Set(ensureVaultMeta());
   let n = 0;
-  const entries = Object.entries(files || {}).filter(([fn]) => fn.startsWith('img_'));
-  for (const [fname, f] of entries) {
-    const name = fname.slice(4);
+  /* v4.6.17: restore from the MANIFEST (meta.vaultedShots), not from the gist files list.
+     The list is cut off past ~300 files, which used to hide the newest screenshots from the
+     restore entirely — they were in the vault all along. Anything present in the listing but
+     absent from the manifest is still swept up, so old vaults keep working. */
+  const names = new Set(vaulted);
+  for (const fn of Object.keys(files || {})) {
+    if (!fn.startsWith('img_')) continue;
+    const nm = fn.slice(4);
+    if (SHOT_EXT.test(nm)) names.add(nm);
+  }
+  for (const name of names) {
     if (!SHOT_EXT.test(name)) continue;
     const onDisk = path.join(UPLOADS, name);
     if (fs.existsSync(onDisk)) { vaulted.add(name); continue; } // already have it
-    let content = f && f.content;
-    if ((!content || f.truncated) && GIST_TOKEN) content = await vaultRaw(fname); // <— the fix
+    const f = (files || {})['img_' + name];
+    // inline listing content costs no request — use it when GitHub didn't truncate it
+    let content = (f && f.content && !f.truncated) ? f.content : null;
+    if (!content) content = await vaultRaw('img_' + name);
     if (!content) continue;
     try {
       fs.mkdirSync(UPLOADS, { recursive: true });
       fs.writeFileSync(onDisk, Buffer.from(String(content).replace(/\s+/g, ''), 'base64'));
       vaulted.add(name); n++;
-    } catch (e) { console.error('vault shot decode failed:', fname, e.message); }
+    } catch (e) { console.error('vault shot decode failed:', name, e.message); }
   }
   state.meta.vaultedShots = [...vaulted];
   if (n) console.log(`🖼️  Pixel Vault: ${n} screenshot(s) resurrected from gist`);
@@ -253,7 +272,11 @@ async function gistBoot() {
       gist.id = found.id;
       gist.url = found.html_url || '';
       const full = await gh('https://api.github.com/gists/' + found.id);
-      const content = full.files[GIST_FILE] && full.files[GIST_FILE].content;
+      /* v4.6.17: read the data file by RAW URL. Its inline content is truncated past ~1MB
+         and the files list is truncated past ~300 entries — with a full vault of screenshots
+         the data file could drop out of the listing and we'd boot up empty-handed. */
+      let content = await gistRaw(GIST_FILE, 30000);
+      if (!content || content.length <= 10) content = full.files[GIST_FILE] && full.files[GIST_FILE].content;
       if (content && content.length > 10) {
         const incoming = migrate(JSON.parse(content));
         // remember what the vault holds, so we can refuse to overwrite it with emptiness
@@ -410,7 +433,7 @@ async function pushGistNow() {
         if (bytes + s.size > 25e6) break;
         try {
           files['img_' + s.name] = { content: fs.readFileSync(path.join(UPLOADS, s.name)).toString('base64') };
-          swept.push(s.name); bytes += s.size;
+          swept.push(s); bytes += s.size;
         } catch {}
       }
       if (gist.id) {
@@ -432,7 +455,9 @@ async function pushGistNow() {
       }
       if (swept.length) {
         const vaulted = new Set(ensureVaultMeta());
-        swept.forEach(n => vaulted.add(n));
+        // v4.6.17: remember each file's size so the vault health meter can report real MBs
+        const sizes = (state.meta.vaultSizes = state.meta.vaultSizes || {});
+        swept.forEach(s => { vaulted.add(s.name); sizes[s.name] = s.size; });
         state.meta.vaultedShots = [...vaulted];
         console.log(`🖼️  Pixel Vault: ${swept.length} screenshot(s) backed up to gist (${Math.round(bytes / 1024)}KB)`);
         gist.remoteTrades = (state.trades || []).length; // vault now matches local
@@ -481,6 +506,38 @@ function deleteTradeFiles(trade) {
 }
 
 /* ---------------- server ---------------- */
+/* v4.6.17 VAULT HEALTH — GitHub cuts the gist FILES LIST off at ~300 entries. Every
+   screenshot costs one file, so a busy journal creeps toward a cliff where new shots are
+   safely vaulted yet invisible to the restore. This reports how close we are, and which
+   screenshots are referenced by trades but NOT in the vault (i.e. genuinely at risk). */
+const VAULT_FILE_SAFE = 300;
+function vaultHealth() {
+  const vaulted = ensureVaultMeta();
+  const sizes = (state.meta && state.meta.vaultSizes) || {};
+  const vaultSet = new Set(vaulted);
+  const bytes = vaulted.reduce((a, n) => a + (sizes[n] || 0), 0);
+  const referenced = new Set();
+  for (const t of (state.trades || [])) {
+    for (const sh of (t.screenshots || [])) {
+      const url = typeof sh === 'string' ? sh : ((sh && sh.url) || '');
+      if (url && url.startsWith('/uploads/')) referenced.add(path.basename(url));
+    }
+  }
+  const atRisk = [...referenced].filter(n => !vaultSet.has(n));
+  let onDisk = 0;
+  try { onDisk = fs.readdirSync(UPLOADS).filter(n => SHOT_EXT.test(n)).length; } catch {}
+  const files = vaulted.length;
+  const pct = Math.min(100, Math.round((files / VAULT_FILE_SAFE) * 100));
+  return {
+    ok: true, enabled: !!GIST_TOKEN, linked: !!gist.id, gistUrl: gist.url || '',
+    files, bytes, limit: VAULT_FILE_SAFE, pct,
+    warn: files >= VAULT_FILE_SAFE * 0.8,
+    critical: files >= VAULT_FILE_SAFE,
+    onDisk, referenced: referenced.size, atRisk,
+    dataBytes: Buffer.byteLength(JSON.stringify(state)),
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
@@ -493,10 +550,12 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === '/api/meta' && req.method === 'GET') {
       const lb = (state.meta && state.meta.lastBackup) || null;
+      const vh = vaultHealth();
       return send(res, 200, { version: 4, gistSync: gist.enabled, gistFound: !!gist.id, restored: !!gist.restored,
         aiConfigured: !!aiCfg().key, pixelVault: cloudReady() || gist.enabled, shotsVaulted: ensureVaultMeta().length,
         gistUrl: gist.url || '', trades: (state.trades || []).length,
-        snapshots: ((state.meta && state.meta.snapshots) || []).length, lastBackup: lb });
+        snapshots: ((state.meta && state.meta.snapshots) || []).length, lastBackup: lb,
+        vaultFiles: vh.files, vaultBytes: vh.bytes, vaultPct: vh.pct, vaultWarn: vh.warn, vaultAtRisk: vh.atRisk.length });
     }
 
     if (p === '/api/trade' && req.method === 'POST') {
@@ -654,6 +713,11 @@ function missingShots() {
   }
   return out;
 }
+
+    /* v4.6.17: vault capacity + what's genuinely at risk (referenced but never vaulted). */
+    if (p === '/api/vault/health' && req.method === 'GET') {
+      return send(res, 200, vaultHealth());
+    }
 
     /* v4.6.7: which screenshots referenced by trades are actually missing from disk?
        (Render wipes /uploads on deploy; anything too big to vault comes back 404.) */
