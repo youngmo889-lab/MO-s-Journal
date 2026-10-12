@@ -335,6 +335,43 @@ async function backupSnapshot() {
   return { at: state.meta.lastBackup.at, trades: state.meta.lastBackup.trades, shots: state.meta.lastBackup.shots, snapshot: name, kept: keep.length, url: gist.url || '' };
 }
 
+/* v4.6.16 SELF-HEALING IMAGES: a missing /uploads file is fetched from the vault the moment
+   it is requested, written back to disk and served — so screenshots can never show as broken
+   just because a deploy wiped the disk or a boot restore skipped a file. */
+const healInflight = new Map();
+const healFailed = new Map();               // negative cache: don't hammer the API
+const HEAL_NEG_TTL = 5 * 60 * 1000;
+function healShot(name) {
+  const abs = path.join(UPLOADS, name);
+  try { if (fs.existsSync(abs)) return Promise.resolve(fs.readFileSync(abs)); } catch {}
+  if (!GIST_TOKEN || !gist.id) return Promise.resolve(null);
+  if (healFailed.has(name) && Date.now() - healFailed.get(name) < HEAL_NEG_TTL) return Promise.resolve(null);
+  if (healInflight.has(name)) return healInflight.get(name);
+  const job = (async () => {
+    const raw = await vaultRaw('img_' + name);
+    if (!raw) { healFailed.set(name, Date.now()); return null; }
+    try {
+      const buf = Buffer.from(String(raw).replace(/\s+/g, ''), 'base64');
+      fs.mkdirSync(UPLOADS, { recursive: true });
+      fs.writeFileSync(abs, buf);
+      console.log(`🩹 self-healed ${name} from the vault (${Math.round(buf.length / 1024)}KB)`);
+      return buf;
+    } catch (e) { healFailed.set(name, Date.now()); return null; }
+  })().finally(() => healInflight.delete(name));
+  healInflight.set(name, job);
+  return job;
+}
+/* After boot, quietly top up anything the restore step missed. */
+async function restoreMissingShots() {
+  if (!GIST_TOKEN) return;
+  const missing = missingShots();
+  if (!missing.length) return;
+  let n = 0;
+  for (const m of missing) { if (await healShot(m.name)) n++; }
+  if (n) console.log(`🩹 post-boot restore: ${n}/${missing.length} screenshot(s) recovered`);
+  else if (missing.length) console.log(`⚠️  ${missing.length} screenshot(s) referenced but absent from the vault — they were never backed up.`);
+}
+
 async function pushGistNow() {
   try {
       if (!gist.enabled) {
@@ -927,9 +964,16 @@ function missingShots() {
       const name = path.basename(decodeURIComponent(p));
       const abs = path.join(UPLOADS, name);
       return fs.readFile(abs, (err, data) => {
-        if (err) return send(res, 404, 'not found');
-        res.writeHead(200, { 'Content-Type': MIME[path.extname(name).toLowerCase()] || 'image/jpeg', 'Cache-Control': 'max-age=86400' });
-        res.end(data);
+        if (!err) {
+          res.writeHead(200, { 'Content-Type': MIME[path.extname(name).toLowerCase()] || 'image/jpeg', 'Cache-Control': 'max-age=86400' });
+          return res.end(data);
+        }
+        // not on disk — pull it out of the vault right now instead of showing a broken image
+        healShot(name).then(buf => {
+          if (!buf) return send(res, 404, 'not found');
+          res.writeHead(200, { 'Content-Type': MIME[path.extname(name).toLowerCase()] || 'image/jpeg', 'Cache-Control': 'max-age=86400' });
+          res.end(buf);
+        }).catch(() => send(res, 404, 'not found'));
       });
     }
 
@@ -972,6 +1016,8 @@ function missingShots() {
     // v4.6.0 KEEP-AWAKE: Render's free tier sleeps after ~15 min idle — and waking up
     // used to roll the vault back to a stale key. We ping ourselves every 10 min so the
     // server is never the reason a flow dies. (Only when KEEP_AWAKE_URL is set, e.g. on Render.)
+    // v4.6.16: give the boot restore a moment, then quietly top up anything it missed
+    setTimeout(() => { restoreMissingShots().catch(e => console.log('post-boot restore failed:', e.message)); }, 20000);
     const wakeUrl = process.env.KEEP_AWAKE_URL || (process.env.RENDER_EXTERNAL_URL ? process.env.RENDER_EXTERNAL_URL + '/api/state' : '');
     if (wakeUrl) {
       setInterval(() => {
